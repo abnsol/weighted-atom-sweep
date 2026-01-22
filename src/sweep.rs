@@ -3,9 +3,14 @@ use crate::operation::{Operation, OperationObserver};
 use crate::traversal::TransversalEngine;
 use pathmap::PathMap;
 use pathmap::zipper::{ZipperCreation, ZipperHeadOwned};
-use std::sync::{Arc, mpsc, atomic::{AtomicBool, Ordering}};
+use std::marker::PhantomData;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread::JoinHandle;
-use tracing::{debug, trace, instrument, span, Level};
+use tracing::{Level, debug, instrument, span, trace};
 
 pub type AtomPosition = Vec<u8>;
 
@@ -21,6 +26,75 @@ pub trait SweepTransversalEngine<H: AtomHeader>:
 }
 
 pub struct WeightedAtomSweepSettings {}
+
+/// Represents a single traversal engine with its subscribed operations.
+///
+/// Each process spawns 2 threads when the sweep is started:
+/// - A traversal thread that continuously samples atoms using the engine
+/// - An operations thread that applies subscribed operations to sampled atoms
+pub struct SweepProcess<T, O, H>
+where
+    T: SweepTransversalEngine<H>,
+    O: KernelOperation<H>,
+    H: AtomHeader,
+{
+    engine: Arc<T>,
+    operations: Vec<O>,
+    _phantom: PhantomData<H>,
+}
+
+impl<T, O, H> SweepProcess<T, O, H>
+where
+    T: SweepTransversalEngine<H>,
+    O: KernelOperation<H>,
+    H: AtomHeader,
+{
+    /// Create a new traversal process with the given engine and no operations.
+    pub fn new(engine: T) -> Self {
+        debug!("creating new TraversalProcess");
+        Self {
+            engine: Arc::new(engine),
+            operations: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Get the number of operations subscribed to this process.
+    pub fn operation_count(&self) -> usize {
+        self.operations.len()
+    }
+}
+
+impl<T, O, H> OperationObserver<H, O> for SweepProcess<T, O, H>
+where
+    T: SweepTransversalEngine<H>,
+    O: KernelOperation<H>,
+    H: AtomHeader,
+{
+    #[instrument(skip_all, name = "process.subscribe", fields(op_name = operation.name()))]
+    fn subscribe(&mut self, operation: O) {
+        let total_operations = self.operations.len() + 1;
+        debug!(
+            operation_name = operation.name(),
+            total_operations, "subscribing operation to process"
+        );
+        self.operations.push(operation);
+        trace!("operation subscribed successfully");
+    }
+
+    #[instrument(skip_all, name = "process.unsubscribe", fields(op_name = operation.name()))]
+    fn unsubscribe(&mut self, operation: O) {
+        let initial_count = self.operations.len();
+        debug!(
+            operation_name = operation.name(),
+            initial_count, "unsubscribing operation from process"
+        );
+        self.operations.retain(|op| op != &operation);
+        let final_count = self.operations.len();
+        let removed = initial_count - final_count;
+        debug!(removed, final_count, "operation unsubscribe complete");
+    }
+}
 
 pub struct SweepController<H: AtomHeader> {
     pub map: Arc<ZipperHeadOwned<H>>,
@@ -47,7 +121,9 @@ impl<H: AtomHeader> SweepController<H> {
         self.shutdown_signal.store(true, Ordering::SeqCst);
 
         for handle in self.handles.drain(..) {
-            handle.join().map_err(|_| "thread panicked during shutdown")?;
+            handle
+                .join()
+                .map_err(|_| "thread panicked during shutdown")?;
         }
 
         debug!("sweep shutdown complete");
@@ -58,6 +134,17 @@ impl<H: AtomHeader> SweepController<H> {
     pub fn map_ref(&self) -> &Arc<ZipperHeadOwned<H>> {
         &self.map
     }
+
+    /// Get the number of threads managed by this controller.
+    /// This will be 2*N where N is the number of processes.
+    pub fn thread_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Get the number of processes (thread pairs) in this sweep.
+    pub fn process_count(&self) -> usize {
+        self.handles.len() / 2
+    }
 }
 
 pub struct WeightedAtomSweep<T, O, H>
@@ -66,11 +153,9 @@ where
     O: KernelOperation<H>,
     H: AtomHeader,
 {
-    // pub reciever: mpsc::Receiver<T::Atom>,
-    pub traversal: Arc<T>,
-    pub operations: Vec<O>,
-    pub settings: WeightedAtomSweepSettings,
-    pub map: WeightedMap<H>,
+    processes: Vec<SweepProcess<T, O, H>>,
+    settings: WeightedAtomSweepSettings,
+    map: WeightedMap<H>,
 }
 
 impl<T, O, H> WeightedAtomSweep<T, O, H>
@@ -80,14 +165,12 @@ where
     H: AtomHeader,
 {
     #[instrument(skip_all, name = "sweep.new")]
-    pub fn new(traversal: T, operations: Vec<O>, settings: WeightedAtomSweepSettings) -> Self {
-        let operation_count = operations.len();
-        debug!(operation_count, "initializing WeightedAtomSweep");
+    pub fn new(settings: WeightedAtomSweepSettings) -> Self {
+        debug!("initializing WeightedAtomSweep");
         trace!("creating new PathMap and initializing WeightedMap");
 
         let result = Self {
-            traversal: Arc::new(traversal),
-            operations: operations,
+            processes: Vec::new(),
             settings,
             map: WeightedMap {
                 inner: Arc::new(PathMap::<H>::new().into_zipper_head([])),
@@ -98,147 +181,196 @@ where
         result
     }
 
+    /// Add a traversal engine to the sweep and return a mutable reference
+    /// to configure it (subscribe operations).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut sweep = WeightedAtomSweep::new(settings);
+    /// let process = sweep.add_engine(importance_engine);
+    /// process.subscribe(importance_op);
+    /// ```
+    #[instrument(skip_all, name = "sweep.add_engine")]
+    pub fn add_engine(&mut self, engine: T) -> &mut SweepProcess<T, O, H> {
+        debug!("adding new traversal engine to sweep");
+        let process = SweepProcess::new(engine);
+        self.processes.push(process);
+        let process_count = self.processes.len();
+        debug!(process_count, "engine added successfully");
+        self.processes.last_mut().unwrap()
+    }
+
+    /// Get the number of processes (engines) in this sweep.
+    pub fn process_count(&self) -> usize {
+        self.processes.len()
+    }
+
     // TODO: map can be limited to a subset of the map
     #[instrument(skip_all, name = "sweep.spawn")]
     pub fn spawn(self) -> SweepController<H> {
-        debug!("spawning WeightedAtomSweep threads");
+        let process_count = self.processes.len();
+        debug!(process_count, "spawning WeightedAtomSweep threads");
 
-        let (atom_sender, atom_reciever) = mpsc::channel::<AtomPosition>();
-        let engine = self.traversal.clone();
-        let sender = atom_sender.clone();
+        if process_count == 0 {
+            debug!("warning: no processes added, sweep will do nothing");
+        }
+
         let map = self.map.inner.clone();
-        let operation_count = self.operations.len();
-
         let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_traversal = shutdown.clone();
-        let shutdown_operations = shutdown.clone();
-
         let mut handles = Vec::new();
 
-        // spawn traversal thread
-        let traversal_handle = std::thread::spawn(move || {
-            let traversal_span = span!(Level::DEBUG, "traversal_thread");
-            let _enter = traversal_span.enter();
+        // Spawn thread pairs for each process
+        for (process_idx, process) in self.processes.into_iter().enumerate() {
+            let engine = process.engine.clone();
+            let operations = process.operations;
+            let operation_count = operations.len();
 
-            debug!("traversal thread started - entering sampling loop");
+            // Clone shared resources for this process
+            let map_for_traversal = self.map.inner.clone();
+            let shutdown_traversal = shutdown.clone();
+            let shutdown_operations = shutdown.clone();
 
-            loop {
-                // Check for shutdown signal
-                if shutdown_traversal.load(Ordering::Relaxed) {
-                    debug!("shutdown signal received, exiting traversal loop");
-                    break;
-                }
+            // Create channel for this process
+            let (atom_sender, atom_receiver) = mpsc::channel::<AtomPosition>();
 
-                // get access to a read zipper at root for sampling
-                match self.map.read_zipper_at_borrowed_path(&[]) {
-                    Ok(traverse_zp) => {
-                        trace!("acquired read zipper for sampling");
-                        match engine.next_atom(traverse_zp) {
-                            Ok(atom_path) => {
-                                debug!(atom_path_len = atom_path.len(), "atom sampled via traversal");
-                                if sender.send(atom_path).is_err() {
-                                    debug!("operations thread terminated - stopping traversal");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                // Log and continue (resilient mode as per user requirement)
-                                trace!("error during atom traversal: {:?}", e);
-                                // Don't break - continue sampling
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        trace!("failed to acquire read zipper: {:?}", e);
-                        // Continue trying in case of transient errors
-                    }
-                }
-            }
+            // Spawn traversal thread for this process
+            let traversal_handle = std::thread::spawn(move || {
+                let traversal_span = span!(Level::DEBUG, "traversal_thread", process_idx);
+                let _enter = traversal_span.enter();
 
-            debug!("traversal thread completed");
-            drop(sender); // Signal operations thread that no more atoms will be sent
-        });
+                debug!(
+                    process_idx,
+                    "traversal thread started - entering sampling loop"
+                );
 
-        handles.push(traversal_handle);
-
-        // handle traversed atoms
-        let operations_handle = std::thread::spawn(move || {
-            let operations_span = span!(Level::DEBUG, "operations_thread", operation_count);
-            let _enter = operations_span.enter();
-
-            debug!("operations thread started - entering processing loop");
-
-            loop {
-                match atom_reciever.recv() {
-                    Ok(atom_path) => {
-                        let atom = Arc::new(atom_path);
-                        debug!(atom_len = atom.len(), operation_count, "processing atom with operations");
-
-                        for (idx, op) in self.operations.iter().enumerate() {
-                            let op_span = span!(Level::TRACE, "operation", index = idx, name = op.name());
-                            let _op_enter = op_span.enter();
-
-                            trace!("executing operation");
-
-                            // Catch panics to prevent thread death
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                op.transform(atom.clone().into());
-                            }));
-
-                            if let Err(e) = result {
-                                // Log panic but continue with next operation (resilient mode)
-                                trace!("operation panicked: {:?}", e);
-                            } else {
-                                trace!("operation completed");
-                            }
-                        }
-
-                        debug!("all operations completed for atom");
-                    }
-                    Err(_) => {
-                        debug!("traversal complete - channel closed, no more atoms");
+                loop {
+                    // Check for shutdown signal
+                    if shutdown_traversal.load(Ordering::Relaxed) {
+                        debug!(
+                            process_idx,
+                            "shutdown signal received, exiting traversal loop"
+                        );
                         break;
                     }
+
+                    // Get access to a read zipper at root for sampling
+                    match (*map_for_traversal).read_zipper_at_borrowed_path(&[]) {
+                        Ok(traverse_zp) => {
+                            trace!(process_idx, "acquired read zipper for sampling");
+                            match engine.next_atom(traverse_zp) {
+                                Ok(atom_path) => {
+                                    debug!(
+                                        process_idx,
+                                        atom_path_len = atom_path.len(),
+                                        "atom sampled via traversal"
+                                    );
+                                    if atom_sender.send(atom_path).is_err() {
+                                        debug!(
+                                            process_idx,
+                                            "operations thread terminated - stopping traversal"
+                                        );
+                                        break; // TODO: consider continuing traversal on failure
+                                    }
+                                }
+                                Err(e) => {
+                                    // Log and continue (resilient mode)
+                                    trace!(process_idx, "error during atom traversal: {:?}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            trace!(process_idx, "failed to acquire read zipper: {:?}", e);
+                        }
+                    }
                 }
-            }
 
-            debug!("operations thread completed");
-            shutdown_operations.store(true, Ordering::Relaxed); // Signal completion
-        });
+                debug!(process_idx, "traversal thread completed");
+                drop(atom_sender); // Signal operations thread
+            });
 
-        handles.push(operations_handle);
+            handles.push(traversal_handle);
 
-        debug!("spawn operation complete, returning controller");
+            // Spawn operations thread for this process
+            let operations_handle = std::thread::spawn(move || {
+                let operations_span = span!(
+                    Level::DEBUG,
+                    "operations_thread",
+                    process_idx,
+                    operation_count
+                );
+                let _enter = operations_span.enter();
+
+                debug!(
+                    process_idx,
+                    operation_count, "operations thread started - entering processing loop"
+                );
+
+                loop {
+                    match atom_receiver.recv() {
+                        Ok(atom_path) => {
+                            let atom = Arc::new(atom_path);
+                            debug!(
+                                process_idx,
+                                atom_len = atom.len(),
+                                operation_count,
+                                "processing atom with operations"
+                            );
+
+                            for (idx, op) in operations.iter().enumerate() {
+                                let op_span = span!(
+                                    Level::TRACE,
+                                    "operation",
+                                    process_idx,
+                                    operation_idx = idx,
+                                    name = op.name()
+                                );
+                                let _op_enter = op_span.enter();
+
+                                trace!(process_idx, "executing operation");
+
+                                // Catch panics to prevent thread death
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        op.transform(atom.clone());
+                                    }));
+
+                                if let Err(e) = result {
+                                    trace!(process_idx, "operation panicked: {:?}", e);
+                                } else {
+                                    trace!(process_idx, "operation completed");
+                                }
+                            }
+
+                            debug!(process_idx, "all operations completed for atom");
+                        }
+                        Err(_) => {
+                            debug!(
+                                process_idx,
+                                "traversal complete - channel closed, no more atoms"
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                debug!(process_idx, "operations thread completed");
+                shutdown_operations.store(true, Ordering::Relaxed);
+            });
+
+            handles.push(operations_handle);
+
+            debug!(process_idx, "spawned thread pair for process");
+        }
+
+        debug!(
+            total_threads = handles.len(),
+            "spawn operation complete, returning controller"
+        );
 
         SweepController {
             map,
             handles,
             shutdown_signal: shutdown,
         }
-    }
-}
-
-impl<T, O, H> OperationObserver<H, O> for WeightedAtomSweep<T, O, H>
-where
-    T: SweepTransversalEngine<H>,
-    O: KernelOperation<H>,
-    H: AtomHeader,
-{
-    #[instrument(skip_all, name = "sweep.subscribe", fields(op_name = operation.name()))]
-    fn subscribe(&mut self, operation: O) {
-        let total_operations = self.operations.len() + 1;
-        debug!(operation_name = operation.name(), total_operations, "subscribing operation");
-        self.operations.push(operation);
-        trace!("operation subscribed successfully");
-    }
-
-    #[instrument(skip_all, name = "sweep.unsubscribe", fields(op_name = operation.name()))]
-    fn unsubscribe(&mut self, operation: O) {
-        let initial_count = self.operations.len();
-        debug!(operation_name = operation.name(), initial_count, "unsubscribing operation");
-        self.operations.retain(|op| op != &operation);
-        let final_count = self.operations.len();
-        let removed = initial_count - final_count;
-        debug!(removed, final_count, "operation unsubscribe complete");
     }
 }

@@ -1,9 +1,8 @@
 use crate::map::WeightedMap;
 use crate::operation::{Operation, OperationObserver};
-use crate::traversal::TransversalEngine;
+use crate::traversal::TraversalEngine;
 use pathmap::PathMap;
 use pathmap::zipper::{ZipperCreation, ZipperHeadOwned};
-use std::marker::PhantomData;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -15,15 +14,6 @@ use tracing::{Level, debug, instrument, span, trace};
 pub type AtomPosition = Vec<u8>;
 
 pub trait AtomHeader: std::fmt::Debug + Clone + Send + Sync + Unpin + 'static {}
-pub trait KernelOperation<H: AtomHeader>:
-    Operation<H> + Send + Sync + Clone + std::fmt::Debug + PartialEq + 'static
-{
-}
-
-pub trait SweepTransversalEngine<H: AtomHeader>:
-    for<'a> TransversalEngine<H> + Send + Sync + Clone + std::fmt::Debug + 'static
-{
-}
 
 pub struct WeightedAtomSweepSettings {}
 
@@ -32,30 +22,24 @@ pub struct WeightedAtomSweepSettings {}
 /// Each process spawns 2 threads when the sweep is started:
 /// - A traversal thread that continuously samples atoms using the engine
 /// - An operations thread that applies subscribed operations to sampled atoms
-pub struct SweepProcess<T, O, H>
+pub struct SweepProcess<H>
 where
-    T: SweepTransversalEngine<H>,
-    O: KernelOperation<H>,
     H: AtomHeader,
 {
-    engine: Arc<T>,
-    operations: Vec<O>,
-    _phantom: PhantomData<H>,
+    engine: TraversalEngine<H>,
+    operations: Vec<Operation>,
 }
 
-impl<T, O, H> SweepProcess<T, O, H>
+impl<H> SweepProcess<H>
 where
-    T: SweepTransversalEngine<H>,
-    O: KernelOperation<H>,
     H: AtomHeader,
 {
     /// Create a new traversal process with the given engine and no operations.
-    pub fn new(engine: T) -> Self {
+    pub fn new(engine: TraversalEngine<H>) -> Self {
         debug!("creating new TraversalProcess");
         Self {
-            engine: Arc::new(engine),
+            engine,
             operations: Vec::new(),
-            _phantom: PhantomData,
         }
     }
 
@@ -65,28 +49,26 @@ where
     }
 }
 
-impl<T, O, H> OperationObserver<H, O> for SweepProcess<T, O, H>
+impl<H> OperationObserver for SweepProcess<H>
 where
-    T: SweepTransversalEngine<H>,
-    O: KernelOperation<H>,
     H: AtomHeader,
 {
-    #[instrument(skip_all, name = "process.subscribe", fields(op_name = operation.name()))]
-    fn subscribe(&mut self, operation: O) {
+    #[instrument(skip_all, name = "process.subscribe", fields(op_name = operation.name))]
+    fn subscribe(&mut self, operation: Operation) {
         let total_operations = self.operations.len() + 1;
         debug!(
-            operation_name = operation.name(),
+            operation_name = operation.name,
             total_operations, "subscribing operation to process"
         );
         self.operations.push(operation);
         trace!("operation subscribed successfully");
     }
 
-    #[instrument(skip_all, name = "process.unsubscribe", fields(op_name = operation.name()))]
-    fn unsubscribe(&mut self, operation: O) {
+    #[instrument(skip_all, name = "process.unsubscribe", fields(op_name = operation.name))]
+    fn unsubscribe(&mut self, operation: Operation) {
         let initial_count = self.operations.len();
         debug!(
-            operation_name = operation.name(),
+            operation_name = operation.name,
             initial_count, "unsubscribing operation from process"
         );
         self.operations.retain(|op| op != &operation);
@@ -147,21 +129,18 @@ impl<H: AtomHeader> SweepController<H> {
     }
 }
 
-pub struct WeightedAtomSweep<T, O, H>
+#[allow(dead_code)]
+pub struct WeightedAtomSweep<H>
 where
-    T: SweepTransversalEngine<H>,
-    O: KernelOperation<H>,
     H: AtomHeader,
 {
-    processes: Vec<SweepProcess<T, O, H>>,
+    processes: Vec<SweepProcess<H>>,
     settings: WeightedAtomSweepSettings,
     map: WeightedMap<H>,
 }
 
-impl<T, O, H> WeightedAtomSweep<T, O, H>
+impl<H> WeightedAtomSweep<H>
 where
-    T: SweepTransversalEngine<H>,
-    O: KernelOperation<H>,
     H: AtomHeader,
 {
     #[instrument(skip_all, name = "sweep.new")]
@@ -191,7 +170,7 @@ where
     /// process.subscribe(importance_op);
     /// ```
     #[instrument(skip_all, name = "sweep.add_engine")]
-    pub fn add_engine(&mut self, engine: T) -> &mut SweepProcess<T, O, H> {
+    pub fn add_engine(&mut self, engine: TraversalEngine<H>) -> &mut SweepProcess<H> {
         debug!("adding new traversal engine to sweep");
         let process = SweepProcess::new(engine);
         self.processes.push(process);
@@ -257,7 +236,7 @@ where
                     match (*map_for_traversal).read_zipper_at_borrowed_path(&[]) {
                         Ok(traverse_zp) => {
                             trace!(process_idx, "acquired read zipper for sampling");
-                            match engine.next_atom(traverse_zp) {
+                            match (engine.next_atom)(traverse_zp) {
                                 Ok(atom_path) => {
                                     debug!(
                                         process_idx,
@@ -322,7 +301,7 @@ where
                                     "operation",
                                     process_idx,
                                     operation_idx = idx,
-                                    name = op.name()
+                                    name = op.name
                                 );
                                 let _op_enter = op_span.enter();
 
@@ -331,7 +310,7 @@ where
                                 // Catch panics to prevent thread death
                                 let result =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        op.transform(atom.clone());
+                                        (op.transform)(atom.clone());
                                     }));
 
                                 if let Err(e) = result {

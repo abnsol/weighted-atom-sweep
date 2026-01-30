@@ -1,56 +1,55 @@
 use std::sync::Arc;
 
-use crate::sweep::{AtomHeader, AtomPosition};
+use crate::sweep::AtomPosition;
 
-/// Trait for operations that transform atoms.
+/// Operation struct for transforming atoms.
 ///
-/// Implementations should:
-/// - Use `#[instrument(skip(self, zipper), name = "operation.{operation_name}")]`
-/// - Emit debug-level logs for the start and completion of transformations
-/// - Emit trace-level logs for detailed transformation steps
-///
-/// # Example Implementation with Tracing
+/// # Example
 /// ```ignore
-/// use tracing::instrument;
+/// use std::sync::Arc;
+/// use weighted_atom_sweep::{Operation, AtomPosition};
 ///
-/// struct MyOperation;
-///
-/// impl Operation<MyAtom> for MyOperation {
-///     fn name(&self) -> &str { "my_operation" }
-///
-///     #[instrument(skip(self, zipper), name = "operation.my_operation")]
-///     fn transform(&self, zipper: Arc<AtomPosition>) {
-///         debug!("starting transformation");
-///         // ... transformation logic ...
-///         debug!("transformation complete");
-///     }
+/// fn my_transform(atom: Arc<AtomPosition>) {
+///     // ... transformation logic ...
 /// }
+///
+/// let op = Operation {
+///     name: "my_operation",
+///     transform: &my_transform,
+/// };
 /// ```
-pub trait Operation<H: AtomHeader> {
-    /// Get the name of this operation for logging and identification.
-    fn name(&self) -> &str;
+#[derive(Clone, Copy, Debug)]
+pub struct Operation {
+    pub name: &'static str,
+    pub transform: &'static fn(Arc<AtomPosition>),
+}
 
-    /// Transform the given atom position.
-    ///
-    /// Implementers should use `#[instrument]` and emit appropriate tracing logs.
-    fn transform(&self, zipper: Arc<AtomPosition>) -> ();
+impl Operation {
+    /// Create a new operation with the given name and transform function.
+    pub fn new(name: &'static str, transform: &'static fn(Arc<AtomPosition>)) -> Self {
+        Self { name, transform }
+    }
+}
+
+impl PartialEq for Operation {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && (self.transform as *const _ as usize) == (other.transform as *const _ as usize)
+    }
 }
 
 /// Observer pattern trait for managing operation subscriptions.
 ///
 /// Implementations emit debug-level traces for subscription state changes.
-pub trait OperationObserver<H, O>
-where
-    H: AtomHeader,
-    O: Operation<H>,
-{
+#[allow(dead_code)]
+pub trait OperationObserver {
     /// Subscribe an operation to be executed.
     ///
     /// Emits debug-level traces about the subscription.
-    fn subscribe(&mut self, observer: O);
+    fn subscribe(&mut self, operation: Operation);
 
     /// Unsubscribe an operation from execution.
     ///
     /// Emits debug-level traces about the unsubscription and how many operations remain.
-    fn unsubscribe(&mut self, observer: O);
+    fn unsubscribe(&mut self, operation: Operation);
 }

@@ -86,28 +86,26 @@
 //! }
 //! ```
 //!
-//! ## Implementing Custom Operations with Tracing
+//! ## Creating Custom Operations
 //!
-//! When implementing the `Operation` trait, use the `#[instrument]` macro:
+//! Operations are defined as structs containing a name and transform function:
 //!
 //! ```ignore
 //! use tracing::{instrument, debug};
 //! use std::sync::Arc;
+//! use weighted_atom_sweep::{Operation, AtomPosition};
 //!
-//! struct MyCustomOperation;
-//!
-//! impl Operation<MyAtom> for MyCustomOperation {
-//!     fn name(&self) -> &str {
-//!         "my_custom_operation"
-//!     }
-//!
-//!     #[instrument(skip(self, zipper), name = "operation.my_custom_operation")]
-//!     fn transform(&self, zipper: Arc<AtomPosition>) {
-//!         debug!("starting custom transformation");
-//!         // Your transformation logic here
-//!         debug!("transformation completed");
-//!     }
+//! #[instrument(skip(atom), name = "operation.my_custom_operation")]
+//! fn my_custom_transform(atom: Arc<AtomPosition>) {
+//!     debug!("starting custom transformation");
+//!     // Your transformation logic here
+//!     debug!("transformation completed");
 //! }
+//!
+//! let my_operation = Operation {
+//!     name: "my_custom_operation",
+//!     transform: &my_custom_transform,
+//! };
 //! ```
 
 mod map;
@@ -115,4 +113,7 @@ mod operation;
 mod sweep;
 mod traversal;
 
+pub use operation::Operation;
 pub use sweep::WeightedAtomSweep;
+pub use sweep::*;
+pub use traversal::TraversalEngine;

@@ -15,6 +15,7 @@ pub type AtomPosition = Vec<u8>;
 
 pub trait AtomHeader: std::fmt::Debug + Clone + Send + Sync + Unpin + 'static {}
 
+#[derive(Default)]
 pub struct WeightedAtomSweepSettings {}
 
 /// Represents a single traversal engine with its subscribed operations.

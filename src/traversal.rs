@@ -38,14 +38,14 @@ impl Error for TraversalError {}
 #[derive(Clone, Copy, Debug)]
 pub struct TraversalEngine<H: AtomHeader> {
     pub name: &'static str,
-    pub next_atom: &'static fn(ReadZipperTracked<H>) -> Result<AtomPosition, TraversalError>,
+    pub next_atom: fn(ReadZipperTracked<H>) -> Result<AtomPosition, TraversalError>,
 }
 
 impl<H: AtomHeader> TraversalEngine<H> {
     /// Create a new traversal engine with the given name and next_atom function.
     pub fn new(
         name: &'static str,
-        next_atom: &'static fn(ReadZipperTracked<H>) -> Result<AtomPosition, TraversalError>,
+        next_atom: fn(ReadZipperTracked<H>) -> Result<AtomPosition, TraversalError>,
     ) -> Self {
         Self { name, next_atom }
     }
@@ -54,6 +54,5 @@ impl<H: AtomHeader> TraversalEngine<H> {
 impl<H: AtomHeader> PartialEq for TraversalEngine<H> {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
-            && (self.next_atom as *const _ as usize) == (other.next_atom as *const _ as usize)
     }
 }

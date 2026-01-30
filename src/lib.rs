@@ -113,7 +113,7 @@ mod operation;
 mod sweep;
 mod traversal;
 
-pub use operation::Operation;
+pub use operation::{Operation, OperationObserver};
 pub use sweep::WeightedAtomSweep;
 pub use sweep::*;
-pub use traversal::TraversalEngine;
+pub use traversal::{TraversalEngine, TraversalError};

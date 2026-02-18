@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use mork_expr::{Expr, Tag, byte_item};
+use mork_expr::{byte_item, Expr, Tag};
 use pathmap::zipper::{WriteZipperTracked, Zipper, ZipperMoving, ZipperWriting};
 use tracing::{debug, trace};
 
@@ -68,6 +70,9 @@ pub struct SExprOperation<H: AtomHeader> {
     expr_data: Vec<u8>,
     /// The operation mode.
     mode: SExprMode,
+    /// Cumulative match counter for Match mode. Incremented each time
+    /// `apply_match` finds a complete match. Observable via [`Self::match_count()`].
+    match_counter: Arc<AtomicUsize>,
     _phantom: PhantomData<H>,
 }
 
@@ -95,6 +100,7 @@ impl<H: AtomHeader> SExprOperation<H> {
             name,
             expr_data,
             mode,
+            match_counter: Arc::new(AtomicUsize::new(0)),
             _phantom: PhantomData,
         }
     }
@@ -113,6 +119,7 @@ impl<H: AtomHeader> SExprOperation<H> {
             name: name.into(),
             expr_data: expr_bytes.to_vec(),
             mode,
+            match_counter: Arc::new(AtomicUsize::new(0)),
             _phantom: PhantomData,
         }
     }
@@ -125,6 +132,20 @@ impl<H: AtomHeader> SExprOperation<H> {
     /// Returns the operation mode.
     pub fn mode(&self) -> &SExprMode {
         &self.mode
+    }
+
+    /// Returns the cumulative number of matches found by Match mode.
+    ///
+    /// This counter is incremented each time `apply` is called in Match mode
+    /// and a complete pattern match is found. It accumulates across multiple
+    /// `apply` calls.
+    pub fn match_count(&self) -> usize {
+        self.match_counter.load(Ordering::Relaxed)
+    }
+
+    /// Resets the cumulative match counter to zero.
+    pub fn reset_match_count(&self) {
+        self.match_counter.store(0, Ordering::Relaxed);
     }
 
     /// Apply in Add mode: descend along the expression's byte path and
@@ -194,9 +215,12 @@ impl<H: AtomHeader> SExprOperation<H> {
 
         self.match_item(wz, 0, &mut references, &mut match_count);
 
+        self.match_counter.fetch_add(match_count, Ordering::Relaxed);
+
         debug!(
             name = %self.name,
             match_count,
+            total_matches = self.match_counter.load(Ordering::Relaxed),
             "SExprOperation::apply_match complete"
         );
     }

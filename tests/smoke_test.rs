@@ -16,60 +16,44 @@ impl AtomHeader for Header {}
 
 mod engines {
     use pathmap::zipper::ReadZipperTracked;
-    use tracing::debug;
     use weighted_atom_sweep::{AtomPosition, TraversalError};
 
     use super::Header;
 
     pub fn engine1(_z: ReadZipperTracked<Header>) -> Result<AtomPosition, TraversalError> {
-        // debug!("engine1 traversal running");
         std::thread::sleep(std::time::Duration::from_millis(3000));
-        // debug!("engine1 sampled atom");
         Ok(vec![0])
     }
 
     pub fn engine2(_z: ReadZipperTracked<Header>) -> Result<AtomPosition, TraversalError> {
-        // debug!("engine2 traversal running");
         std::thread::sleep(std::time::Duration::from_millis(2500));
-        // debug!("engine2 sampled atom");
         Ok(vec![1])
     }
 }
 
 mod operations {
-    use std::sync::Arc;
-    use weighted_atom_sweep::AtomPosition;
+    use super::Header;
+    use pathmap::zipper::WriteZipperTracked;
 
-    pub fn log_atom(_atom: Arc<AtomPosition>) {
-        // debug!(_atom_len = _atom.len(), "operation: received atom");
+    pub fn log_atom(_wz: &mut WriteZipperTracked<Header>) {
         std::thread::sleep(std::time::Duration::from_millis(1000));
     }
 
-    pub fn process_atom(_atom: Arc<AtomPosition>) {
-        // debug!(_atom_len = _atom.len(), "operation: processing atom");
+    pub fn process_atom(_wz: &mut WriteZipperTracked<Header>) {
         std::thread::sleep(std::time::Duration::from_millis(5000));
     }
 
-    pub fn validate_atom(_atom: Arc<AtomPosition>) {
-        // debug!(_atom_len = _atom.len(), "operation: validating atom");
+    pub fn validate_atom(_wz: &mut WriteZipperTracked<Header>) {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    pub fn transform_atom(_atom: Arc<AtomPosition>) {
-        // debug!(_atom_len = _atom.len(), "operation: transforming atom");
+    pub fn transform_atom(_wz: &mut WriteZipperTracked<Header>) {
         std::thread::sleep(std::time::Duration::from_millis(800));
     }
 
-    pub fn persist_atom(_atom: Arc<AtomPosition>) {
-        // debug!(_atom_len = _atom.len(), "operation: persisting atom");
+    pub fn persist_atom(_wz: &mut WriteZipperTracked<Header>) {
         std::thread::sleep(std::time::Duration::from_millis(600));
     }
-
-    pub const LOG_ATOM_FN: fn(Arc<AtomPosition>) = log_atom;
-    pub const PROCESS_ATOM_FN: fn(Arc<AtomPosition>) = process_atom;
-    pub const VALIDATE_ATOM_FN: fn(Arc<AtomPosition>) = validate_atom;
-    pub const TRANSFORM_ATOM_FN: fn(Arc<AtomPosition>) = transform_atom;
-    pub const PERSIST_ATOM_FN: fn(Arc<AtomPosition>) = persist_atom;
 }
 
 #[test]
@@ -85,11 +69,11 @@ fn smoke_test() {
     let engine1 = TraversalEngine::new("engine1", engines::engine1);
     let process1 = sweep.add_engine(engine1);
 
-    let log_op = Operation::new("log_atom", &operations::LOG_ATOM_FN);
-    let process_op = Operation::new("process_atom", &operations::PROCESS_ATOM_FN);
-    let validate_op = Operation::new("validate_atom", &operations::VALIDATE_ATOM_FN);
-    let transform_op = Operation::new("transform_atom", &operations::TRANSFORM_ATOM_FN);
-    let persist_op = Operation::new("persist_atom", &operations::PERSIST_ATOM_FN);
+    let log_op = Operation::<Header>::new("log_atom", operations::log_atom);
+    let process_op = Operation::<Header>::new("process_atom", operations::process_atom);
+    let validate_op = Operation::<Header>::new("validate_atom", operations::validate_atom);
+    let transform_op = Operation::<Header>::new("transform_atom", operations::transform_atom);
+    let persist_op = Operation::<Header>::new("persist_atom", operations::persist_atom);
 
     process1.subscribe(log_op);
     process1.subscribe(process_op);
@@ -101,30 +85,20 @@ fn smoke_test() {
     let engine2 = TraversalEngine::new("engine2", engines::engine2);
     let process2 = sweep.add_engine(engine2);
 
-    let log_op2 = Operation::new("log_atom", &operations::LOG_ATOM_FN);
-    let validate_op2 = Operation::new("validate_atom", &operations::VALIDATE_ATOM_FN);
-    let persist_op2 = Operation::new("persist_atom", &operations::PERSIST_ATOM_FN);
+    let log_op2 = Operation::<Header>::new("log_atom", operations::log_atom);
+    let validate_op2 = Operation::<Header>::new("validate_atom", operations::validate_atom);
+    let persist_op2 = Operation::<Header>::new("persist_atom", operations::persist_atom);
 
     process2.subscribe(log_op2);
     process2.subscribe(validate_op2);
     process2.subscribe(persist_op2);
 
-    // tracing::info!(
-    //     "[SMOKE_TEST] sweep configured with {} process(es)",
-    //     sweep.process_count()
-    // );
-
     // Spawn the sweep threads
     let controller = sweep.spawn();
-    // tracing::info!(
-    //     "[SMOKE_TEST] sweep spawned with {} thread(s)",
-    //     controller.thread_count()
-    // );
 
     // Let it run briefly then shutdown
     std::thread::sleep(std::time::Duration::from_millis(10_000));
     let result = controller.shutdown();
 
     assert!(result.is_ok(), "sweep shutdown should succeed");
-    // tracing::info!("[SMOKE_TEST] smoke test completed successfully");
 }

@@ -47,9 +47,9 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "fast-slice-utils"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7f7bedd5e26edc56da9d5e5d224a60a87a034bcca4a3413251bd7802d715fe4"
+checksum = "7a6f7d9b6886c61a9db24b28fe7990090621c7e8c4e3df3fed3a831fe29e15f4"
 
 [[package]]
 name = "find-msvc-tools"
@@ -116,6 +116,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mork-expr"
+version = "0.1.0"
+dependencies = [
+ "fast-slice-utils",
+ "smallvec",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -141,7 +150,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "pathmap"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "arrayvec",
  "dyn-clone",
@@ -320,6 +329,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 name = "weighted-atom-sweep"
 version = "0.1.0"
 dependencies = [
+ "mork-expr",
  "pathmap",
  "tracing",
  "tracing-subscriber",

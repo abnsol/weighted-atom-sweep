@@ -1,15 +1,14 @@
 use crate::map::WeightedMap;
-use crate::operation::{Operation, OperationObserver};
+use crate::operation::{OperationObserver, TransformOp};
 use crate::traversal::TraversalEngine;
+use pathmap::zipper::{ZipperCreation, ZipperHeadOwned, ZipperMoving};
 use pathmap::PathMap;
-use pathmap::zipper::{ZipperCreation, ZipperHeadOwned};
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc,
+    mpsc, Arc,
 };
 use std::thread::JoinHandle;
-use tracing::{Level, debug, instrument, span, trace};
+use tracing::{debug, instrument, span, trace, Level};
 
 pub type AtomPosition = Vec<u8>;
 
@@ -22,13 +21,14 @@ pub struct WeightedAtomSweepSettings {}
 ///
 /// Each process spawns 2 threads when the sweep is started:
 /// - A traversal thread that continuously samples atoms using the engine
-/// - An operations thread that applies subscribed operations to sampled atoms
+/// - An operations thread that acquires write zippers at sampled positions
+///   and applies subscribed operations to the focused subtrie
 pub struct SweepProcess<H>
 where
     H: AtomHeader,
 {
     engine: TraversalEngine<H>,
-    operations: Vec<Operation>,
+    operations: Vec<Box<dyn TransformOp<H>>>,
 }
 
 impl<H> SweepProcess<H>
@@ -50,29 +50,30 @@ where
     }
 }
 
-impl<H> OperationObserver for SweepProcess<H>
+impl<H> OperationObserver<H> for SweepProcess<H>
 where
     H: AtomHeader,
 {
-    #[instrument(skip_all, name = "process.subscribe", fields(op_name = operation.name))]
-    fn subscribe(&mut self, operation: Operation) {
+    #[instrument(skip_all, name = "process.subscribe")]
+    fn subscribe(&mut self, operation: impl TransformOp<H> + 'static) {
+        let name = operation.name().to_string();
         let total_operations = self.operations.len() + 1;
         debug!(
-            operation_name = operation.name,
+            operation_name = %name,
             total_operations, "subscribing operation to process"
         );
-        self.operations.push(operation);
+        self.operations.push(Box::new(operation));
         trace!("operation subscribed successfully");
     }
 
-    #[instrument(skip_all, name = "process.unsubscribe", fields(op_name = operation.name))]
-    fn unsubscribe(&mut self, operation: Operation) {
+    #[instrument(skip_all, name = "process.unsubscribe_by_name")]
+    fn unsubscribe_by_name(&mut self, name: &str) {
         let initial_count = self.operations.len();
         debug!(
-            operation_name = operation.name,
+            operation_name = name,
             initial_count, "unsubscribing operation from process"
         );
-        self.operations.retain(|op| op != &operation);
+        self.operations.retain(|op| op.name() != name);
         let final_count = self.operations.len();
         let removed = initial_count - final_count;
         debug!(removed, final_count, "operation unsubscribe complete");
@@ -168,7 +169,7 @@ where
     /// ```ignore
     /// let mut sweep = WeightedAtomSweep::new(settings);
     /// let process = sweep.add_engine(importance_engine);
-    /// process.subscribe(importance_op);
+    /// process.subscribe(my_operation);
     /// ```
     #[instrument(skip_all, name = "sweep.add_engine")]
     pub fn add_engine(&mut self, engine: TraversalEngine<H>) -> &mut SweepProcess<H> {
@@ -185,7 +186,6 @@ where
         self.processes.len()
     }
 
-    // TODO: map can be limited to a subset of the map
     #[instrument(skip_all, name = "sweep.spawn")]
     pub fn spawn(self) -> SweepController<H> {
         let process_count = self.processes.len();
@@ -207,6 +207,7 @@ where
 
             // Clone shared resources for this process
             let map_for_traversal = self.map.inner.clone();
+            let map_for_operations = self.map.inner.clone();
             let shutdown_traversal = shutdown.clone();
             let shutdown_operations = shutdown.clone();
 
@@ -214,6 +215,12 @@ where
             let (atom_sender, atom_receiver) = mpsc::channel::<AtomPosition>();
 
             // Spawn traversal thread for this process
+            //
+            // The traversal thread creates a ReadZipperTracked at root, uses the
+            // engine to sample an atom, then DROPS the read zipper before sending
+            // the AtomPosition through the channel. This ensures no read zipper is
+            // held while the operations thread acquires a write zipper, avoiding
+            // zipper conflicts.
             let traversal_handle = std::thread::spawn(move || {
                 let traversal_span = span!(Level::DEBUG, "traversal_thread", process_idx);
                 let _enter = traversal_span.enter();
@@ -233,7 +240,9 @@ where
                         break;
                     }
 
-                    // Get access to a read zipper at root for sampling
+                    // Get access to a read zipper at root for sampling.
+                    // The read zipper is created and consumed within this match block,
+                    // ensuring it is dropped before atom_sender.send() is called.
                     match (*map_for_traversal).read_zipper_at_borrowed_path(&[]) {
                         Ok(traverse_zp) => {
                             trace!(process_idx, "acquired read zipper for sampling");
@@ -249,7 +258,7 @@ where
                                             process_idx,
                                             "operations thread terminated - stopping traversal"
                                         );
-                                        break; // TODO: consider continuing traversal on failure
+                                        break;
                                     }
                                 }
                                 Err(e) => {
@@ -271,6 +280,15 @@ where
             handles.push(traversal_handle);
 
             // Spawn operations thread for this process
+            //
+            // For each received AtomPosition, the operations thread acquires a
+            // WriteZipperTracked focused at that path via write_zipper_at_exclusive_path.
+            // This write zipper is scoped: the operation can navigate and modify the
+            // subtrie at and below the focus, but cannot ascend above it.
+            //
+            // After all operations complete, the write zipper is cleaned up via
+            // cleanup_write_zipper to prune any dangling paths created by the
+            // exclusive path mechanism.
             let operations_handle = std::thread::spawn(move || {
                 let operations_span = span!(
                     Level::DEBUG,
@@ -288,40 +306,68 @@ where
                 loop {
                     match atom_receiver.recv() {
                         Ok(atom_path) => {
-                            let atom = Arc::new(atom_path);
                             debug!(
                                 process_idx,
-                                atom_len = atom.len(),
+                                atom_path_len = atom_path.len(),
                                 operation_count,
                                 "processing atom with operations"
                             );
 
-                            for (idx, op) in operations.iter().enumerate() {
-                                let op_span = span!(
-                                    Level::TRACE,
-                                    "operation",
-                                    process_idx,
-                                    operation_idx = idx,
-                                    name = op.name
-                                );
-                                let _op_enter = op_span.enter();
+                            // Acquire a write zipper at the atom's position.
+                            // This gives exclusive write access to the subtrie at
+                            // and below atom_path. The zipper's root IS atom_path,
+                            // so ascend() returns false at this boundary.
+                            match map_for_operations.write_zipper_at_exclusive_path(&atom_path[..])
+                            {
+                                Ok(mut wz) => {
+                                    for (idx, op) in operations.iter().enumerate() {
+                                        let op_span = span!(
+                                            Level::TRACE,
+                                            "operation",
+                                            process_idx,
+                                            operation_idx = idx,
+                                            name = op.name()
+                                        );
+                                        let _op_enter = op_span.enter();
 
-                                trace!(process_idx, "executing operation");
+                                        trace!(process_idx, "executing operation");
 
-                                // Catch panics to prevent thread death
-                                let result =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        (op.transform)(atom.clone());
-                                    }));
+                                        // Catch panics to prevent thread death
+                                        let result = std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| {
+                                                op.apply(&mut wz);
+                                            }),
+                                        );
 
-                                if let Err(e) = result {
-                                    trace!(process_idx, "operation panicked: {:?}", e);
-                                } else {
-                                    trace!(process_idx, "operation completed");
+                                        if let Err(e) = result {
+                                            trace!(process_idx, "operation panicked: {:?}", e);
+                                        } else {
+                                            trace!(process_idx, "operation completed");
+                                        }
+
+                                        // Reset the write zipper to the focus root
+                                        // between operations so each starts at the
+                                        // same position
+                                        wz.reset();
+                                    }
+
+                                    // Cleanup the write zipper: drops it and prunes
+                                    // any dangling path nodes created by the exclusive
+                                    // path mechanism
+                                    map_for_operations.cleanup_write_zipper(wz);
+
+                                    debug!(process_idx, "all operations completed for atom");
+                                }
+                                Err(conflict) => {
+                                    // Another process may hold a conflicting zipper.
+                                    // Skip this atom and continue processing.
+                                    trace!(
+                                        process_idx,
+                                        "write zipper conflict for atom, skipping: {:?}",
+                                        conflict
+                                    );
                                 }
                             }
-
-                            debug!(process_idx, "all operations completed for atom");
                         }
                         Err(_) => {
                             debug!(

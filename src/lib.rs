@@ -19,22 +19,27 @@
 //! Two concrete operation types are provided:
 //!
 //! - [`Operation<H>`] — a stateless function pointer for simple transforms
-//! - [`SExprOperation<H>`] — carries an mm2 s-expression (from mork-expr) that
-//!   defines the transformation. Supports add, remove, and pattern match modes.
+//! - [`SExprOperation<H>`] — an mm2 exec operation that pattern-matches against
+//!   the subtrie and instantiates templates with variable bindings
 //!
 //! Both implement the [`TransformOp<H>`] trait and can be mixed freely within a
 //! single [`SweepProcess`].
 //!
-//! ## mm2 S-Expression Operations
+//! ## mm2 Exec Operations
 //!
-//! The [`SExprOperation`] type enables MORK-style s-expression operations within
-//! the sweep framework. S-expressions are binary-encoded using mork-expr's [`Tag`]
-//! system and stored as trie paths in the PathMap. Three modes are supported:
+//! The [`SExprOperation`] type enables MORK-style exec operations within the
+//! sweep framework. An exec operation carries a **pattern** and a list of
+//! **(template, effect)** pairs:
 //!
-//! - **Add**: Insert the expression as a path in the subtrie
-//! - **Remove**: Delete the expression's path from the subtrie
-//! - **Match**: Pattern-match the expression against the subtrie structure,
-//!   with variable support (NewVar as wildcards, VarRef for co-referential bindings)
+//! 1. The pattern is walked against the trie structure using mm2 tag encoding.
+//!    Concrete elements (symbols, arities) must match exactly. Variables
+//!    (`NewVar` as wildcards, `VarRef` for co-referential bindings) match
+//!    flexibly.
+//! 2. For each match, mork-expr's `extract_data` extracts variable bindings.
+//! 3. Each template is instantiated via `substitute` with those bindings.
+//! 4. The [`TemplateEffect`] determines the action:
+//!    - **Add**: Insert the instantiated template as a trie path
+//!    - **Remove**: Delete the instantiated template's trie path
 //!
 //! # Tracing Instrumentation
 //!
@@ -133,7 +138,7 @@
 //!
 //! impl<H: AtomHeader> TransformOp<H> for MyCustomOp {
 //!     fn name(&self) -> &str { "my_custom_operation" }
-//!     fn apply(&self, wz: &mut WriteZipperTracked<H>) {
+//!     fn apply(&self, wz: &mut WriteZipperTracked<H>, _atom_path: &[u8]) {
 //!         debug!("starting custom transformation");
 //!         // Navigate and modify the subtrie via wz
 //!         debug!("transformation completed");
@@ -147,7 +152,7 @@
 //! use weighted_atom_sweep::{Operation, AtomHeader};
 //! use pathmap::zipper::WriteZipperTracked;
 //!
-//! fn my_transform(wz: &mut WriteZipperTracked<MyHeader>) {
+//! fn my_transform(wz: &mut WriteZipperTracked<MyHeader>, _atom_path: &[u8]) {
 //!     // ... transformation logic ...
 //! }
 //!
@@ -161,7 +166,7 @@ mod sweep;
 mod traversal;
 
 pub use operation::{Operation, OperationObserver, TransformOp};
-pub use sexpr_operation::{SExprMode, SExprOperation};
+pub use sexpr_operation::{SExprOperation, TemplateEffect};
 pub use sweep::WeightedAtomSweep;
 pub use sweep::*;
 pub use traversal::{TraversalEngine, TraversalError};

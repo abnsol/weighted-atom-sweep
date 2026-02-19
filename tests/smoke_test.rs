@@ -35,23 +35,23 @@ mod operations {
     use super::Header;
     use pathmap::zipper::WriteZipperTracked;
 
-    pub fn log_atom(_wz: &mut WriteZipperTracked<Header>) {
+    pub fn log_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
         std::thread::sleep(std::time::Duration::from_millis(1000));
     }
 
-    pub fn process_atom(_wz: &mut WriteZipperTracked<Header>) {
+    pub fn process_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
         std::thread::sleep(std::time::Duration::from_millis(5000));
     }
 
-    pub fn validate_atom(_wz: &mut WriteZipperTracked<Header>) {
+    pub fn validate_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    pub fn transform_atom(_wz: &mut WriteZipperTracked<Header>) {
+    pub fn transform_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
         std::thread::sleep(std::time::Duration::from_millis(800));
     }
 
-    pub fn persist_atom(_wz: &mut WriteZipperTracked<Header>) {
+    pub fn persist_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
         std::thread::sleep(std::time::Duration::from_millis(600));
     }
 }

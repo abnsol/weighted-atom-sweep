@@ -1,22 +1,25 @@
-//! Tests demonstrating `SExprOperation` — mm2 s-expression operations
-//! within the weighted-atom-sweep framework.
+//! Tests demonstrating `SExprOperation` in the exec model.
 //!
-//! These tests exercise the three modes of `SExprOperation`:
-//! - **Add**: inserting an expression as a trie path
-//! - **Remove**: deleting an expression's trie path
-//! - **Match**: pattern-matching an expression against the trie structure
+//! An `SExprOperation` carries a pattern and a list of (template, effect) pairs.
+//! For each pattern match in the subtrie, variables are extracted via mork-expr's
+//! `extract_data` and substituted into each template via `substitute`. The
+//! resulting expression bytes are applied to the trie per the template effect
+//! (Add or Remove).
 //!
-//! The first three tests are direct (no sweep threads) — they construct a
-//! `ZipperHeadOwned`, acquire a `WriteZipperTracked`, and call `apply()`
-//! directly. The fourth test runs an `SExprOperation` inside the full
-//! sweep loop.
+//! The tests cover:
+//! - Exec with no pattern (unconditional template application)
+//! - Exec with pattern only (match counting, no templates)
+//! - Exec with pattern + Add templates (match-then-add)
+//! - Exec with pattern + Remove templates (match-then-remove)
+//! - Full sweep loop integration
+//! - Encoding verification
 
 use mork_expr::{item_byte, parse, Tag};
 use pathmap::zipper::{Zipper, ZipperCreation};
 use pathmap::PathMap;
 
 use weighted_atom_sweep::{
-    AtomHeader, Operation, OperationObserver, SExprMode, SExprOperation, TransformOp,
+    AtomHeader, Operation, OperationObserver, SExprOperation, TemplateEffect, TransformOp,
     TraversalEngine, WeightedAtomSweep, WeightedAtomSweepSettings,
 };
 
@@ -30,87 +33,81 @@ pub struct Header;
 impl AtomHeader for Header {}
 
 // ---------------------------------------------------------------------------
-// Helper: encode an expression with parse! and return the byte slice
+// Helper: encode expressions with parse! and return byte vecs
 // ---------------------------------------------------------------------------
 
-/// Encode `(foo bar)` — arity 2, symbol "foo", symbol "bar"
+/// `(foo bar)` — arity 2, symbol "foo", symbol "bar"
 fn expr_foo_bar() -> Vec<u8> {
-    let data = parse!("[2] foo bar");
-    data.to_vec()
+    parse!("[2] foo bar").to_vec()
 }
 
-/// Encode `(= a a)` — arity 3, symbol "=", symbol "a", symbol "a"
+/// `(= a a)` — arity 3, symbol "=", symbol "a", symbol "a"
 fn expr_eq_a_a() -> Vec<u8> {
-    let data = parse!("[3] = a a");
-    data.to_vec()
+    parse!("[3] = a a").to_vec()
 }
 
-/// Encode `(= b b)`
+/// `(= b b)`
 fn expr_eq_b_b() -> Vec<u8> {
-    let data = parse!("[3] = b b");
-    data.to_vec()
+    parse!("[3] = b b").to_vec()
 }
 
-/// Encode `(= a b)`
+/// `(= a b)`
 fn expr_eq_a_b() -> Vec<u8> {
-    let data = parse!("[3] = a b");
-    data.to_vec()
+    parse!("[3] = a b").to_vec()
 }
 
-/// Encode `(= $ _1)` — the co-referential match pattern
+/// `(= $ _1)` — co-referential match pattern
 fn pattern_eq_x_x() -> Vec<u8> {
-    let data = parse!("[3] = $ _1");
-    data.to_vec()
+    parse!("[3] = $ _1").to_vec()
 }
 
-/// Encode `(f (g a) b)` — nested expression
+/// `(matched $)` — template that captures the matched variable
+fn template_matched_x() -> Vec<u8> {
+    parse!("[2] matched $").to_vec()
+}
+
+/// `(f (g a) b)` — nested expression
 fn expr_f_ga_b() -> Vec<u8> {
-    let data = parse!("[3] f [2] g a b");
-    data.to_vec()
+    parse!("[3] f [2] g a b").to_vec()
 }
 
 // ===========================================================================
-// Test 1: SExprOperation::Add — direct application
+// Test 1: Exec with no pattern — unconditional Add
 // ===========================================================================
 
+/// An exec with an empty pattern applies templates directly (no matching).
 #[test]
-fn test_sexpr_add_direct() {
+fn test_exec_no_pattern_add() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
         .with_test_writer()
         .try_init();
 
     let expr_bytes = expr_foo_bar();
-
-    // Create an empty trie
     let space = PathMap::<Header>::new().into_zipper_head([]);
 
-    // Build the Add operation
-    let op = SExprOperation::<Header>::from_bytes("add_foo_bar", &expr_bytes, SExprMode::Add);
+    let op =
+        SExprOperation::<Header>::exec("add_foo_bar", &[], &[(&expr_bytes, TemplateEffect::Add)]);
 
-    // Acquire a write zipper at root and apply
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
-        op.apply(&mut wz);
-        // wz is dropped here, releasing the exclusive path
+        op.apply(&mut wz, &[]);
         space.cleanup_write_zipper(wz);
     }
 
-    // Verify the expression path was inserted
     let map = space.into_map();
-    let val = map.get_val_at(&expr_bytes);
     assert!(
-        val.is_some(),
-        "expected a value at the expression path after Add; got None"
+        map.get_val_at(&expr_bytes).is_some(),
+        "expected value at expression path after unconditional Add"
     );
 }
 
 // ===========================================================================
-// Test 2: SExprOperation::Remove — direct application
+// Test 2: Exec with no pattern — unconditional Remove
 // ===========================================================================
 
 #[test]
-fn test_sexpr_remove_direct() {
+fn test_exec_no_pattern_remove() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
         .with_test_writer()
@@ -118,147 +115,302 @@ fn test_sexpr_remove_direct() {
 
     let expr_bytes = expr_foo_bar();
 
-    // Create a trie pre-populated with the expression path
     let mut map = PathMap::<Header>::new();
     map.set_val_at(&expr_bytes, Header);
-    assert!(
-        map.get_val_at(&expr_bytes).is_some(),
-        "precondition: value should exist before Remove"
-    );
+    assert!(map.get_val_at(&expr_bytes).is_some());
 
     let space = map.into_zipper_head([]);
 
-    // Build the Remove operation
-    let op = SExprOperation::<Header>::from_bytes("remove_foo_bar", &expr_bytes, SExprMode::Remove);
+    let op = SExprOperation::<Header>::exec(
+        "remove_foo_bar",
+        &[],
+        &[(&expr_bytes, TemplateEffect::Remove)],
+    );
 
-    // Apply
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
-        op.apply(&mut wz);
+        op.apply(&mut wz, &[]);
         space.cleanup_write_zipper(wz);
     }
 
-    // Verify the expression path was removed
     let map = space.into_map();
-    let val = map.get_val_at(&expr_bytes);
     assert!(
-        val.is_none(),
-        "expected no value at the expression path after Remove; got {:?}",
-        val
+        map.get_val_at(&expr_bytes).is_none(),
+        "expected no value after unconditional Remove"
     );
 }
 
 // ===========================================================================
-// Test 3: SExprOperation::Match — co-referential pattern matching
+// Test 3: Exec with pattern only — match counting
 // ===========================================================================
 
-/// Insert three expressions into the trie:
-///   (= a a)  — self-equal, should match `(= $x $x)`
-///   (= b b)  — self-equal, should match `(= $x $x)`
-///   (= a b)  — NOT self-equal, should NOT match
-///
-/// Then run Match with `(= $ _1)` and verify match_count == 2.
+/// Pattern with no templates — just counts matches.
+/// Pattern `(= $ _1)` against `(= a a)`, `(= b b)`, `(= a b)`.
+/// Should match 2 (the co-referential ones).
 #[test]
-fn test_sexpr_match_direct() {
+fn test_exec_match_only() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
         .with_test_writer()
         .try_init();
 
-    let eq_a_a = expr_eq_a_a();
-    let eq_b_b = expr_eq_b_b();
-    let eq_a_b = expr_eq_a_b();
-    let pattern = pattern_eq_x_x();
-
-    // Populate the trie with three expressions
     let mut map = PathMap::<Header>::new();
-    map.set_val_at(&eq_a_a, Header);
-    map.set_val_at(&eq_b_b, Header);
-    map.set_val_at(&eq_a_b, Header);
+    map.set_val_at(&expr_eq_a_a(), Header);
+    map.set_val_at(&expr_eq_b_b(), Header);
+    map.set_val_at(&expr_eq_a_b(), Header);
 
     let space = map.into_zipper_head([]);
-
-    // Build the Match operation
-    let op = SExprOperation::<Header>::from_bytes("match_eq_x_x", &pattern, SExprMode::Match);
-
-    assert_eq!(op.match_count(), 0, "match count should start at 0");
-
-    // Apply
-    {
-        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
-        op.apply(&mut wz);
-        space.cleanup_write_zipper(wz);
-    }
-
-    // (= a a) and (= b b) should match; (= a b) should not
-    assert_eq!(
-        op.match_count(),
-        2,
-        "expected 2 co-referential matches for pattern (= $ _1)"
-    );
-}
-
-// ===========================================================================
-// Test 4: SExprOperation::Match on a nested expression structure
-// ===========================================================================
-
-/// Insert expressions with different structures and verify a wildcard
-/// pattern matches the expected number of entries.
-///
-///   (= a a)     — matches `(= $ _1)` (same first and second arg)
-///   (= b b)     — matches `(= $ _1)`
-///   (= a b)     — does NOT match
-///   (f (g a) b) — does NOT match (different top-level arity/symbol)
-///
-/// This test also verifies that unrelated expressions in the trie
-/// don't interfere with matching.
-#[test]
-fn test_sexpr_match_with_noise() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_test_writer()
-        .try_init();
-
-    let eq_a_a = expr_eq_a_a();
-    let eq_b_b = expr_eq_b_b();
-    let eq_a_b = expr_eq_a_b();
-    let f_ga_b = expr_f_ga_b();
     let pattern = pattern_eq_x_x();
 
-    let mut map = PathMap::<Header>::new();
-    map.set_val_at(&eq_a_a, Header);
-    map.set_val_at(&eq_b_b, Header);
-    map.set_val_at(&eq_a_b, Header);
-    map.set_val_at(&f_ga_b, Header);
+    let op = SExprOperation::<Header>::exec("match_eq_x_x", &pattern, &[]);
 
-    let space = map.into_zipper_head([]);
-
-    let op = SExprOperation::<Header>::from_bytes("match_eq_x_x", &pattern, SExprMode::Match);
+    assert_eq!(op.match_count(), 0);
 
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
-        op.apply(&mut wz);
+        op.apply(&mut wz, &[]);
         space.cleanup_write_zipper(wz);
     }
 
     assert_eq!(
         op.match_count(),
         2,
-        "noise expressions should not affect co-referential match count"
+        "expected 2 co-referential matches for (= $ _1)"
     );
 }
 
 // ===========================================================================
-// Test 5: SExprOperation::Add inside the full sweep loop
+// Test 4: Exec with pattern + Add template — match then add
 // ===========================================================================
 
-/// Run an `SExprOperation` in Add mode through the full sweep loop.
+/// Match `(= $x $x)`, for each match add `(matched $x)`.
 ///
-/// The traversal engine returns a fixed atom position (root `[]`), and
-/// the operations thread applies the Add operation. After shutdown we
-/// verify the expression path exists in the trie.
+/// Trie starts with: (= a a), (= b b), (= a b)
+/// Pattern: (= $ _1) matches (= a a) and (= b b)
+/// Template: (matched $) with Add
+/// After exec: trie should also contain (matched a) and (matched b)
 #[test]
-fn test_sexpr_in_sweep_loop() {
+fn test_exec_pattern_then_add() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .try_init();
+
+    let mut map = PathMap::<Header>::new();
+    map.set_val_at(&expr_eq_a_a(), Header);
+    map.set_val_at(&expr_eq_b_b(), Header);
+    map.set_val_at(&expr_eq_a_b(), Header);
+
+    let space = map.into_zipper_head([]);
+
+    let pattern = pattern_eq_x_x();
+    let template = template_matched_x();
+
+    let op = SExprOperation::<Header>::exec(
+        "match_and_add",
+        &pattern,
+        &[(&template, TemplateEffect::Add)],
+    );
+
+    {
+        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
+        op.apply(&mut wz, &[]);
+        space.cleanup_write_zipper(wz);
+    }
+
+    assert_eq!(op.match_count(), 2);
+
+    let map = space.into_map();
+
+    // Original expressions should still be there
+    assert!(map.get_val_at(&expr_eq_a_a()).is_some());
+    assert!(map.get_val_at(&expr_eq_b_b()).is_some());
+    assert!(map.get_val_at(&expr_eq_a_b()).is_some());
+
+    // New expressions from template instantiation
+    let matched_a = parse!("[2] matched a").to_vec();
+    let matched_b = parse!("[2] matched b").to_vec();
+
+    assert!(
+        map.get_val_at(&matched_a).is_some(),
+        "expected (matched a) after exec"
+    );
+    assert!(
+        map.get_val_at(&matched_b).is_some(),
+        "expected (matched b) after exec"
+    );
+}
+
+// ===========================================================================
+// Test 5: Exec with pattern + Remove template — match then remove
+// ===========================================================================
+
+/// Match `(= $x $x)`, for each match remove `(= $x $x)` itself.
+///
+/// Trie starts with: (= a a), (= b b), (= a b)
+/// Pattern: (= $ _1)
+/// Template: (= $ _1) with Remove — removes the matched expressions
+/// After exec: (= a a) and (= b b) should be gone, (= a b) remains
+#[test]
+fn test_exec_pattern_then_remove() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .try_init();
+
+    let mut map = PathMap::<Header>::new();
+    map.set_val_at(&expr_eq_a_a(), Header);
+    map.set_val_at(&expr_eq_b_b(), Header);
+    map.set_val_at(&expr_eq_a_b(), Header);
+
+    let space = map.into_zipper_head([]);
+
+    let pattern = pattern_eq_x_x();
+    // Template is the same as pattern — removes the matched path
+    let template = pattern_eq_x_x();
+
+    let op = SExprOperation::<Header>::exec(
+        "match_and_remove",
+        &pattern,
+        &[(&template, TemplateEffect::Remove)],
+    );
+
+    {
+        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
+        op.apply(&mut wz, &[]);
+        space.cleanup_write_zipper(wz);
+    }
+
+    assert_eq!(op.match_count(), 2);
+
+    let map = space.into_map();
+
+    // Co-referential expressions should be removed
+    assert!(
+        map.get_val_at(&expr_eq_a_a()).is_none(),
+        "(= a a) should have been removed"
+    );
+    assert!(
+        map.get_val_at(&expr_eq_b_b()).is_none(),
+        "(= b b) should have been removed"
+    );
+
+    // Non-co-referential expression should remain
+    assert!(
+        map.get_val_at(&expr_eq_a_b()).is_some(),
+        "(= a b) should still be present"
+    );
+}
+
+// ===========================================================================
+// Test 6: Exec with both Add and Remove templates
+// ===========================================================================
+
+/// Match `(= $x $x)`, remove the matched expr and add `(matched $x)`.
+///
+/// This demonstrates a "rewrite rule" — replace co-referential equalities
+/// with a simpler form.
+#[test]
+fn test_exec_rewrite_rule() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .try_init();
+
+    let mut map = PathMap::<Header>::new();
+    map.set_val_at(&expr_eq_a_a(), Header);
+    map.set_val_at(&expr_eq_b_b(), Header);
+    map.set_val_at(&expr_eq_a_b(), Header);
+
+    let space = map.into_zipper_head([]);
+
+    let pattern = pattern_eq_x_x();
+    let remove_template = pattern_eq_x_x(); // remove the matched self-equal
+    let add_template = template_matched_x(); // add (matched $x)
+
+    let op = SExprOperation::<Header>::exec(
+        "rewrite_eq",
+        &pattern,
+        &[
+            (&remove_template, TemplateEffect::Remove),
+            (&add_template, TemplateEffect::Add),
+        ],
+    );
+
+    {
+        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
+        op.apply(&mut wz, &[]);
+        space.cleanup_write_zipper(wz);
+    }
+
+    let map = space.into_map();
+
+    // Self-equal expressions should be gone
+    assert!(map.get_val_at(&expr_eq_a_a()).is_none());
+    assert!(map.get_val_at(&expr_eq_b_b()).is_none());
+
+    // Non-co-referential should remain
+    assert!(map.get_val_at(&expr_eq_a_b()).is_some());
+
+    // Rewritten forms should be present
+    let matched_a = parse!("[2] matched a").to_vec();
+    let matched_b = parse!("[2] matched b").to_vec();
+    assert!(map.get_val_at(&matched_a).is_some());
+    assert!(map.get_val_at(&matched_b).is_some());
+}
+
+// ===========================================================================
+// Test 7: Match count accumulates across multiple apply calls
+// ===========================================================================
+
+#[test]
+fn test_exec_match_count_accumulates() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .try_init();
+
+    let mut map = PathMap::<Header>::new();
+    map.set_val_at(&expr_eq_a_a(), Header);
+    map.set_val_at(&expr_eq_b_b(), Header);
+
+    let space = map.into_zipper_head([]);
+    let pattern = pattern_eq_x_x();
+    let op = SExprOperation::<Header>::exec("match_accum", &pattern, &[]);
+
+    // First apply
+    {
+        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
+        op.apply(&mut wz, &[]);
+        space.cleanup_write_zipper(wz);
+    }
+    assert_eq!(op.match_count(), 2);
+
+    // Second apply — accumulates to 4
+    {
+        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
+        op.apply(&mut wz, &[]);
+        space.cleanup_write_zipper(wz);
+    }
+    assert_eq!(op.match_count(), 4);
+
+    // Reset and apply again
+    op.reset_match_count();
+    assert_eq!(op.match_count(), 0);
+    {
+        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
+        op.apply(&mut wz, &[]);
+        space.cleanup_write_zipper(wz);
+    }
+    assert_eq!(op.match_count(), 2);
+}
+
+// ===========================================================================
+// Test 8: Exec in the full sweep loop
+// ===========================================================================
+
+#[test]
+fn test_exec_in_sweep_loop() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_test_writer()
@@ -268,7 +420,6 @@ fn test_sexpr_in_sweep_loop() {
 
     let mut sweep = WeightedAtomSweep::<Header>::new(WeightedAtomSweepSettings::default());
 
-    // Engine that always returns root position
     let engine = TraversalEngine::new("fixed_root", |_rz| {
         std::thread::sleep(std::time::Duration::from_millis(500));
         Ok(vec![])
@@ -276,18 +427,18 @@ fn test_sexpr_in_sweep_loop() {
 
     let process = sweep.add_engine(engine);
 
-    // Subscribe the mm2 Add operation
-    let add_op = SExprOperation::<Header>::from_bytes("add_foo_bar", &expr_bytes, SExprMode::Add);
+    // Subscribe an exec operation with no pattern (unconditional Add)
+    let add_op =
+        SExprOperation::<Header>::exec("add_foo_bar", &[], &[(&expr_bytes, TemplateEffect::Add)]);
     process.subscribe(add_op);
 
-    // Also subscribe a simple fn-pointer operation for comparison
+    // Also subscribe a simple fn-pointer operation
     let noop = Operation::<Header>::new(
         "noop",
-        |_wz: &mut pathmap::zipper::WriteZipperTracked<Header>| {},
+        |_wz: &mut pathmap::zipper::WriteZipperTracked<Header>, _atom_path: &[u8]| {},
     );
     process.subscribe(noop);
 
-    // Spawn, let it run briefly, then shutdown
     let controller = sweep.spawn();
     std::thread::sleep(std::time::Duration::from_millis(2000));
     let result = controller.shutdown();
@@ -295,123 +446,11 @@ fn test_sexpr_in_sweep_loop() {
 }
 
 // ===========================================================================
-// Test 6: Add then Remove round-trip
+// Test 9: Verify mm2 encoding round-trip
 // ===========================================================================
 
-/// Add an expression, verify it exists, then Remove it, verify it's gone.
-#[test]
-fn test_sexpr_add_then_remove() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_test_writer()
-        .try_init();
-
-    let expr_bytes = expr_f_ga_b();
-
-    let space = PathMap::<Header>::new().into_zipper_head([]);
-
-    // --- Add ---
-    let add_op = SExprOperation::<Header>::from_bytes("add_expr", &expr_bytes, SExprMode::Add);
-    {
-        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
-        add_op.apply(&mut wz);
-        space.cleanup_write_zipper(wz);
-    }
-
-    // Verify it was added (peek via read zipper)
-    {
-        let rz = space.read_zipper_at_borrowed_path(&[] as &[u8]).unwrap();
-        // Navigate to the expression path
-        // We just need to check the trie has content — the read zipper
-        // at root should have children now
-        assert!(rz.child_count() > 0, "trie should have children after Add");
-    }
-
-    // --- Remove ---
-    let remove_op =
-        SExprOperation::<Header>::from_bytes("remove_expr", &expr_bytes, SExprMode::Remove);
-    {
-        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
-        remove_op.apply(&mut wz);
-        space.cleanup_write_zipper(wz);
-    }
-
-    // Verify it was removed
-    let map = space.into_map();
-    assert!(
-        map.get_val_at(&expr_bytes).is_none(),
-        "expression path should be gone after Remove"
-    );
-}
-
-// ===========================================================================
-// Test 7: Match count accumulates across multiple apply calls
-// ===========================================================================
-
-#[test]
-fn test_sexpr_match_count_accumulates() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_test_writer()
-        .try_init();
-
-    let eq_a_a = expr_eq_a_a();
-    let eq_b_b = expr_eq_b_b();
-    let pattern = pattern_eq_x_x();
-
-    let mut map = PathMap::<Header>::new();
-    map.set_val_at(&eq_a_a, Header);
-    map.set_val_at(&eq_b_b, Header);
-
-    let space = map.into_zipper_head([]);
-
-    let op = SExprOperation::<Header>::from_bytes("match_accum", &pattern, SExprMode::Match);
-
-    // First apply
-    {
-        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
-        op.apply(&mut wz);
-        space.cleanup_write_zipper(wz);
-    }
-    assert_eq!(op.match_count(), 2);
-
-    // Second apply — counter should accumulate to 4
-    {
-        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
-        op.apply(&mut wz);
-        space.cleanup_write_zipper(wz);
-    }
-    assert_eq!(op.match_count(), 4, "match_count should accumulate");
-
-    // Reset and apply again — should be 2
-    op.reset_match_count();
-    assert_eq!(op.match_count(), 0);
-    {
-        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
-        op.apply(&mut wz);
-        space.cleanup_write_zipper(wz);
-    }
-    assert_eq!(
-        op.match_count(),
-        2,
-        "match_count should be 2 after reset + apply"
-    );
-}
-
-// ===========================================================================
-// Test 8: Verify mm2 encoding round-trip via manual byte construction
-// ===========================================================================
-
-/// Construct an expression manually byte-by-byte (without parse! macro),
-/// add it to the trie, and verify the path matches what parse! would
-/// produce.
 #[test]
 fn test_manual_encoding_matches_parse() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_test_writer()
-        .try_init();
-
     // Manually encode `(= a a)`:
     //   Arity(3) | SymbolSize(1) '=' | SymbolSize(1) 'a' | SymbolSize(1) 'a'
     let manual_bytes = vec![
@@ -423,15 +462,9 @@ fn test_manual_encoding_matches_parse() {
         item_byte(Tag::SymbolSize(1)),
         b'a',
     ];
+    assert_eq!(manual_bytes, expr_eq_a_a());
 
-    let parsed_bytes = expr_eq_a_a();
-
-    assert_eq!(
-        manual_bytes, parsed_bytes,
-        "manual byte encoding should match parse! output"
-    );
-
-    // Manually encode the match pattern `(= $ _1)`:
+    // Manually encode `(= $ _1)`:
     //   Arity(3) | SymbolSize(1) '=' | NewVar | VarRef(0)
     let manual_pattern = vec![
         item_byte(Tag::Arity(3)),
@@ -440,11 +473,67 @@ fn test_manual_encoding_matches_parse() {
         item_byte(Tag::NewVar),
         item_byte(Tag::VarRef(0)),
     ];
+    assert_eq!(manual_pattern, pattern_eq_x_x());
 
-    let parsed_pattern = pattern_eq_x_x();
+    // Manually encode `(matched $)`:
+    //   Arity(2) | SymbolSize(7) 'matched' | NewVar
+    let manual_template = vec![
+        item_byte(Tag::Arity(2)),
+        item_byte(Tag::SymbolSize(7)),
+        b'm',
+        b'a',
+        b't',
+        b'c',
+        b'h',
+        b'e',
+        b'd',
+        item_byte(Tag::NewVar),
+    ];
+    assert_eq!(manual_template, template_matched_x());
+}
 
-    assert_eq!(
-        manual_pattern, parsed_pattern,
-        "manual pattern encoding should match parse! output"
+// ===========================================================================
+// Test 10: Exec with noise — unrelated expressions don't interfere
+// ===========================================================================
+
+#[test]
+fn test_exec_with_noise() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .try_init();
+
+    let mut map = PathMap::<Header>::new();
+    map.set_val_at(&expr_eq_a_a(), Header);
+    map.set_val_at(&expr_eq_b_b(), Header);
+    map.set_val_at(&expr_eq_a_b(), Header);
+    map.set_val_at(&expr_f_ga_b(), Header); // noise
+
+    let space = map.into_zipper_head([]);
+
+    let pattern = pattern_eq_x_x();
+    let template = template_matched_x();
+
+    let op = SExprOperation::<Header>::exec(
+        "match_with_noise",
+        &pattern,
+        &[(&template, TemplateEffect::Add)],
     );
+
+    {
+        let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
+        op.apply(&mut wz, &[]);
+        space.cleanup_write_zipper(wz);
+    }
+
+    assert_eq!(op.match_count(), 2, "noise should not affect match count");
+
+    let map = space.into_map();
+    let matched_a = parse!("[2] matched a").to_vec();
+    let matched_b = parse!("[2] matched b").to_vec();
+    assert!(map.get_val_at(&matched_a).is_some());
+    assert!(map.get_val_at(&matched_b).is_some());
+
+    // Noise expression should be untouched
+    assert!(map.get_val_at(&expr_f_ga_b()).is_some());
 }

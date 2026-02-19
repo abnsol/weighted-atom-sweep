@@ -4,14 +4,21 @@ use pathmap::zipper::WriteZipperTracked;
 /// Trait for operations that transform a submap of the PathMap trie.
 ///
 /// Operations receive a mutable reference to a [`WriteZipperTracked`] focused at the
-/// atom's position in the trie. The write zipper is scoped to the subtrie at that
-/// position — the operation can read and modify everything at and below the focus,
-/// but cannot ascend above it.
+/// atom's position in the trie, plus the raw `atom_path` bytes returned by the
+/// traversal engine. The write zipper is scoped to the subtrie at that position —
+/// the operation can read and modify everything at and below the focus, but cannot
+/// ascend above it.
+///
+/// The `atom_path` parameter provides contextual information about which atom was
+/// sampled. The zipper is already focused at this path, so operations do not need
+/// to manually descend to it — it serves as metadata (e.g., for logging or for
+/// [`SExprOperation`](crate::sexpr_operation::SExprOperation) which uses it to
+/// understand its execution context).
 ///
 /// Two concrete implementations are provided:
 /// - [`Operation<H>`] — a stateless function pointer for simple transforms
-/// - [`SExprOperation<H>`](crate::sexpr_operation::SExprOperation) — carries an mm2
-///   s-expression that defines the transformation
+/// - [`SExprOperation<H>`](crate::sexpr_operation::SExprOperation) — an mm2 exec
+///   operation that pattern-matches and instantiates templates within the subtrie
 ///
 /// # Example
 /// ```ignore
@@ -22,7 +29,7 @@ use pathmap::zipper::WriteZipperTracked;
 ///
 /// impl<H: AtomHeader> TransformOp<H> for MyOp {
 ///     fn name(&self) -> &str { "my_op" }
-///     fn apply(&self, wz: &mut WriteZipperTracked<H>) {
+///     fn apply(&self, wz: &mut WriteZipperTracked<H>, atom_path: &[u8]) {
 ///         // ... modify the subtrie via wz ...
 ///     }
 ///  }
@@ -33,17 +40,18 @@ pub trait TransformOp<H: AtomHeader>: Send + Sync {
 
     /// Apply the operation to the subtrie accessible via the write zipper.
     ///
-    /// The write zipper is focused at the atom's position in the PathMap trie.
-    /// The operation can navigate and modify the subtrie at and below this focus
-    /// but cannot ascend above the focus point.
-    fn apply(&self, wz: &mut WriteZipperTracked<H>);
+    /// # Arguments
+    /// * `wz` — Write zipper focused at the atom's position in the PathMap trie.
+    /// * `atom_path` — The raw byte path returned by the traversal engine. The
+    ///   zipper is already focused at this path; this parameter provides context.
+    fn apply(&self, wz: &mut WriteZipperTracked<H>, atom_path: &[u8]);
 }
 
 /// A stateless operation defined by a function pointer.
 ///
 /// This is the simplest form of operation — a named function that receives a
-/// [`WriteZipperTracked`] focused at the atom's position. The function can
-/// read and modify the subtrie but cannot ascend above the focus.
+/// [`WriteZipperTracked`] focused at the atom's position and the atom path bytes.
+/// The function can read and modify the subtrie but cannot ascend above the focus.
 ///
 /// # Example
 /// ```ignore
@@ -54,7 +62,7 @@ pub trait TransformOp<H: AtomHeader>: Send + Sync {
 /// struct Header { value: u64 }
 /// impl AtomHeader for Header {}
 ///
-/// fn inspect(wz: &mut WriteZipperTracked<Header>) {
+/// fn inspect(wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
 ///     if let Some(val) = wz.val() {
 ///         tracing::debug!(value = val.value, "inspecting atom");
 ///     }
@@ -65,12 +73,12 @@ pub trait TransformOp<H: AtomHeader>: Send + Sync {
 #[derive(Clone, Copy, Debug)]
 pub struct Operation<H: AtomHeader> {
     pub name: &'static str,
-    pub transform: fn(&mut WriteZipperTracked<H>),
+    pub transform: fn(&mut WriteZipperTracked<H>, &[u8]),
 }
 
 impl<H: AtomHeader> Operation<H> {
     /// Create a new operation with the given name and transform function.
-    pub fn new(name: &'static str, transform: fn(&mut WriteZipperTracked<H>)) -> Self {
+    pub fn new(name: &'static str, transform: fn(&mut WriteZipperTracked<H>, &[u8])) -> Self {
         Self { name, transform }
     }
 }
@@ -86,8 +94,8 @@ impl<H: AtomHeader> TransformOp<H> for Operation<H> {
         self.name
     }
 
-    fn apply(&self, wz: &mut WriteZipperTracked<H>) {
-        (self.transform)(wz);
+    fn apply(&self, wz: &mut WriteZipperTracked<H>, atom_path: &[u8]) {
+        (self.transform)(wz, atom_path);
     }
 }
 

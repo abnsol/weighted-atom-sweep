@@ -2,143 +2,134 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use mork_expr::{byte_item, Expr, Tag};
+use mork_expr::{byte_item, Expr, ExprZipper, Tag};
 use pathmap::zipper::{WriteZipperTracked, Zipper, ZipperMoving, ZipperWriting};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::operation::TransformOp;
 use crate::sweep::AtomHeader;
 
-/// The mode of operation for an [`SExprOperation`].
-///
-/// Determines how the mm2 s-expression is applied to the subtrie
-/// accessible via the write zipper.
+/// The effect applied to a template after variable substitution.
 #[derive(Clone, Debug)]
-pub enum SExprMode {
-    /// Add the expression as a path in the subtrie, setting a value at
-    /// the leaf. The expression bytes become the trie path, descending
-    /// from the write zipper's focus.
+pub enum TemplateEffect {
+    /// Insert the instantiated template as a trie path, setting `H::default()`
+    /// at the leaf.
     Add,
 
-    /// Remove the expression's path from the subtrie. Navigates to the
-    /// path defined by the expression bytes and removes the value (and
-    /// prunes empty branches).
+    /// Remove the instantiated template's trie path from the subtrie
+    /// (with pruning of empty parent nodes).
     Remove,
-
-    /// Match the expression as a pattern against the subtrie.
-    /// Walks the existing trie structure using the expression's tag
-    /// encoding. Concrete elements (symbols, arities) must match
-    /// exactly. Variables (`NewVar`, `VarRef`) act as wildcards that
-    /// match any subtrie.
-    ///
-    /// This is a simplified version of MORK's `coreferential_transition`
-    /// that handles single-pattern matching without the full product
-    /// zipper machinery.
-    Match,
 }
 
-/// An operation that uses an mm2 s-expression to define its transformation.
+/// An mm2 exec operation that pattern-matches against a subtrie and
+/// instantiates templates with the matched variable bindings.
 ///
-/// The s-expression is stored as an owned byte vector (copied from the
-/// original `Expr`). The [`SExprMode`] determines how the expression is
-/// applied to the subtrie.
+/// # Exec Model
+///
+/// An `SExprOperation` carries:
+/// - A **pattern** — an mm2-encoded expression that may contain variables
+///   (`NewVar`, `VarRef`). The pattern is walked against the trie structure
+///   to find matching paths.
+/// - A list of **templates** — mm2-encoded expressions paired with
+///   [`TemplateEffect`]s. For each pattern match, variables are extracted
+///   via mork-expr's `extract_data` and substituted into each template via
+///   `substitute`. The resulting expression bytes are then applied to the
+///   trie per the effect (Add or Remove).
+///
+/// # Path Prefixing
+///
+/// The write zipper passed to `apply` is already focused at the
+/// traversal-returned atom path. Pattern matching and template writes
+/// operate within this focused subtrie. The `atom_path` bytes are passed
+/// for contextual metadata (logging, debugging).
 ///
 /// # Thread Safety
 ///
-/// `SExprOperation` is `Send + Sync` because the expression data is owned
-/// (`Vec<u8>`) and the mode is an enum with no interior mutability.
+/// `SExprOperation` is `Send + Sync` because all fields are owned values
+/// with no interior mutability (except the `AtomicUsize` match counter).
 ///
 /// # Example
 /// ```ignore
-/// use mork_expr::{Expr, parse};
-/// use weighted_atom_sweep::{SExprOperation, SExprMode, AtomHeader};
+/// use mork_expr::parse;
+/// use weighted_atom_sweep::{SExprOperation, TemplateEffect, AtomHeader};
 ///
 /// #[derive(Debug, Clone, Default)]
-/// struct Header;
-/// impl AtomHeader for Header {}
+/// struct H;
+/// impl AtomHeader for H {}
 ///
-/// // Parse an mm2 expression
-/// let expr_bytes = parse!("(foo bar)");
-/// let expr = Expr { ptr: expr_bytes.as_ptr() as *mut u8 };
+/// let pattern = parse!("[3] = $ _1");
+/// let template = parse!("[2] matched $");
 ///
-/// // Create an add operation
-/// let op = SExprOperation::<Header>::new("add_foo_bar", expr, SExprMode::Add);
+/// // Match (= $x $x) in the subtrie, and for each match add (matched $x)
+/// let op = SExprOperation::<H>::exec(
+///     "match_and_add",
+///     &pattern,
+///     &[(&template[..], TemplateEffect::Add)],
+/// );
 /// ```
 pub struct SExprOperation<H: AtomHeader> {
     name: String,
-    /// Owned copy of the mm2 expression bytes.
-    expr_data: Vec<u8>,
-    /// The operation mode.
-    mode: SExprMode,
-    /// Cumulative match counter for Match mode. Incremented each time
-    /// `apply_match` finds a complete match. Observable via [`Self::match_count()`].
+    /// The mm2-encoded pattern expression. May contain `NewVar`/`VarRef`.
+    /// An empty pattern means "match unconditionally" — templates are applied
+    /// directly without variable substitution.
+    pattern: Vec<u8>,
+    /// Template expressions paired with their effects.
+    templates: Vec<(Vec<u8>, TemplateEffect)>,
+    /// Cumulative match counter. Incremented for each successful pattern match.
+    /// Observable via [`Self::match_count()`].
     match_counter: Arc<AtomicUsize>,
     _phantom: PhantomData<H>,
 }
 
 impl<H: AtomHeader> SExprOperation<H> {
-    /// Create a new s-expression operation.
+    /// Create an exec operation.
     ///
     /// # Arguments
-    /// * `name` - A descriptive name for tracing and identification.
-    /// * `expr` - The mm2 s-expression. Its byte span is copied into owned storage.
-    /// * `mode` - How the expression should be applied ([`SExprMode`]).
-    ///
-    /// # Safety
-    /// The `expr.ptr` must point to a valid mm2-encoded expression.
-    pub fn new(name: impl Into<String>, expr: Expr, mode: SExprMode) -> Self {
+    /// * `name` — Descriptive name for tracing and identification.
+    /// * `pattern` — The mm2-encoded pattern bytes. May contain `NewVar`/`VarRef`
+    ///   for wildcard and co-referential matching. Pass `&[]` for unconditional
+    ///   template application (no pattern matching).
+    /// * `templates` — Slice of `(template_bytes, effect)` pairs. For each
+    ///   pattern match, each template is instantiated with the matched variable
+    ///   bindings and the effect is applied.
+    pub fn exec(
+        name: impl Into<String>,
+        pattern: &[u8],
+        templates: &[(&[u8], TemplateEffect)],
+    ) -> Self {
         let name = name.into();
-        let span = unsafe { expr.span().as_ref().unwrap() };
-        let expr_data = span.to_vec();
         debug!(
             name = %name,
-            expr_len = expr_data.len(),
-            ?mode,
-            "creating SExprOperation"
+            pattern_len = pattern.len(),
+            template_count = templates.len(),
+            "creating SExprOperation::exec"
         );
         Self {
             name,
-            expr_data,
-            mode,
+            pattern: pattern.to_vec(),
+            templates: templates
+                .iter()
+                .map(|(t, e)| (t.to_vec(), e.clone()))
+                .collect(),
             match_counter: Arc::new(AtomicUsize::new(0)),
             _phantom: PhantomData,
         }
     }
 
-    /// Create a new s-expression operation directly from raw bytes.
-    ///
-    /// This avoids the need to construct an `Expr` pointer -- the bytes
-    /// are taken as-is.
-    ///
-    /// # Arguments
-    /// * `name` - A descriptive name.
-    /// * `expr_bytes` - The raw mm2-encoded expression bytes.
-    /// * `mode` - How the expression should be applied.
-    pub fn from_bytes(name: impl Into<String>, expr_bytes: &[u8], mode: SExprMode) -> Self {
-        Self {
-            name: name.into(),
-            expr_data: expr_bytes.to_vec(),
-            mode,
-            match_counter: Arc::new(AtomicUsize::new(0)),
-            _phantom: PhantomData,
-        }
+    /// Returns a reference to the pattern bytes.
+    pub fn pattern(&self) -> &[u8] {
+        &self.pattern
     }
 
-    /// Returns a reference to the stored expression bytes.
-    pub fn expr_bytes(&self) -> &[u8] {
-        &self.expr_data
+    /// Returns a reference to the templates.
+    pub fn templates(&self) -> &[(Vec<u8>, TemplateEffect)] {
+        &self.templates
     }
 
-    /// Returns the operation mode.
-    pub fn mode(&self) -> &SExprMode {
-        &self.mode
-    }
-
-    /// Returns the cumulative number of matches found by Match mode.
+    /// Returns the cumulative number of pattern matches found.
     ///
-    /// This counter is incremented each time `apply` is called in Match mode
-    /// and a complete pattern match is found. It accumulates across multiple
-    /// `apply` calls.
+    /// This counter is incremented each time `apply` finds a complete
+    /// pattern match. It accumulates across multiple `apply` calls.
     pub fn match_count(&self) -> usize {
         self.match_counter.load(Ordering::Relaxed)
     }
@@ -148,125 +139,181 @@ impl<H: AtomHeader> SExprOperation<H> {
         self.match_counter.store(0, Ordering::Relaxed);
     }
 
-    /// Apply in Add mode: descend along the expression's byte path and
-    /// set a value at the leaf.
-    fn apply_add(&self, wz: &mut WriteZipperTracked<H>)
+    // -----------------------------------------------------------------------
+    // Template instantiation
+    // -----------------------------------------------------------------------
+
+    /// Apply all templates for a single matched path.
+    ///
+    /// Uses mork-expr's `extract_data` to extract variable bindings from
+    /// the matched data, then `substitute` to instantiate each template.
+    fn apply_templates(&self, wz: &mut WriteZipperTracked<H>, matched_data: &[u8])
     where
         H: Default,
     {
-        let data = &self.expr_data[..];
-        if data.is_empty() {
+        if self.templates.is_empty() {
             return;
         }
-        trace!(
-            name = %self.name,
-            path_len = data.len(),
-            "SExprOperation::apply_add - descending to expression path"
-        );
-        wz.descend_to(data);
-        wz.set_val(H::default());
-        wz.reset();
+
+        // extract_data needs Expr pointers into mutable memory
+        let mut data_buf = matched_data.to_vec();
+        let data_expr = Expr {
+            ptr: data_buf.as_mut_ptr(),
+        };
+
+        let mut pattern_buf = self.pattern.clone();
+        let pattern_expr = Expr {
+            ptr: pattern_buf.as_mut_ptr(),
+        };
+
+        let bindings = match pattern_expr.extract_data(&mut ExprZipper::new(data_expr)) {
+            Ok(b) => b,
+            Err(e) => {
+                trace!(
+                    name = %self.name,
+                    ?e,
+                    "extract_data failed for matched path, skipping templates"
+                );
+                return;
+            }
+        };
+
+        for (tmpl_bytes, effect) in &self.templates {
+            let mut tmpl_buf = tmpl_bytes.clone();
+            let tmpl_expr = Expr {
+                ptr: tmpl_buf.as_mut_ptr(),
+            };
+
+            // Allocate output buffer — generous size
+            let capacity = tmpl_bytes.len() + matched_data.len() * 2 + 64;
+            let mut output_buf = vec![0u8; capacity];
+            let out_expr = Expr {
+                ptr: output_buf.as_mut_ptr(),
+            };
+            let mut oz = ExprZipper::new(out_expr);
+
+            // substitute writes into oz; the return value is the span of the
+            // *template* consumed, not the output.  The output lives in
+            // output_buf[0..oz.loc] after the call.
+            let _template_span = tmpl_expr.substitute(&bindings, &mut oz);
+            let result_bytes = &output_buf[..oz.loc];
+
+            if result_bytes.is_empty() {
+                warn!(
+                    name = %self.name,
+                    "substitute produced empty output, skipping template"
+                );
+                continue;
+            }
+
+            trace!(
+                name = %self.name,
+                result_len = result_bytes.len(),
+                ?effect,
+                "instantiated template"
+            );
+
+            wz.reset();
+            match effect {
+                TemplateEffect::Add => {
+                    wz.descend_to(result_bytes);
+                    wz.set_val(H::default());
+                    wz.reset();
+                }
+                TemplateEffect::Remove => {
+                    wz.descend_to(result_bytes);
+                    if wz.is_val() {
+                        wz.remove_val(true);
+                    }
+                    wz.reset();
+                }
+            }
+        }
     }
 
-    /// Apply in Remove mode: navigate to the expression's byte path
-    /// and remove the value (with pruning).
-    fn apply_remove(&self, wz: &mut WriteZipperTracked<H>) {
-        let data = &self.expr_data[..];
-        if data.is_empty() {
-            return;
+    /// Apply templates unconditionally (no pattern matching, no variable
+    /// substitution). Used when the pattern is empty.
+    fn apply_templates_direct(&self, wz: &mut WriteZipperTracked<H>)
+    where
+        H: Default,
+    {
+        for (tmpl_bytes, effect) in &self.templates {
+            if tmpl_bytes.is_empty() {
+                continue;
+            }
+            trace!(
+                name = %self.name,
+                tmpl_len = tmpl_bytes.len(),
+                ?effect,
+                "applying template directly (no pattern)"
+            );
+            wz.reset();
+            match effect {
+                TemplateEffect::Add => {
+                    wz.descend_to(tmpl_bytes);
+                    wz.set_val(H::default());
+                    wz.reset();
+                }
+                TemplateEffect::Remove => {
+                    wz.descend_to(tmpl_bytes);
+                    if wz.is_val() {
+                        wz.remove_val(true);
+                    }
+                    wz.reset();
+                }
+            }
         }
-        trace!(
-            name = %self.name,
-            path_len = data.len(),
-            "SExprOperation::apply_remove - descending to expression path"
-        );
-        wz.descend_to(data);
-        if wz.is_val() {
-            wz.remove_val(true);
-        }
-        wz.reset();
     }
 
-    /// Apply in Match mode: walk the subtrie matching the expression pattern.
-    ///
-    /// This implements a simplified version of coreferential transition:
-    /// - `SymbolSize(n)` followed by n bytes: must match exactly in the trie
-    /// - `Arity(a)`: must match exactly, then recursively match a children
-    /// - `NewVar`: matches any single item (symbol, arity subtree, or variable)
-    ///   in the trie, enumerating all branches
-    /// - `VarRef(k)`: re-matches the bytes captured at reference k
-    ///
-    /// For each complete match, the write zipper is positioned at the matched
-    /// path.
-    fn apply_match(&self, wz: &mut WriteZipperTracked<H>) {
-        let data = &self.expr_data[..];
-        if data.is_empty() {
-            return;
-        }
+    // -----------------------------------------------------------------------
+    // Trie-walking pattern matcher
+    //
+    // Walks the trie structure matching against the pattern expression.
+    // At each complete match (pattern fully consumed), collects the matched
+    // trie path bytes into `matched_paths`.
+    //
+    // The logic mirrors MORK's `coreferential_transition`:
+    //   - SymbolSize(n) + n bytes: exact match in trie
+    //   - Arity(a): exact match, then recursively match a children
+    //   - NewVar: wildcard, enumerate all children
+    //   - VarRef(k): re-match the bytes captured at reference k
+    // -----------------------------------------------------------------------
 
-        trace!(
-            name = %self.name,
-            expr_len = data.len(),
-            "SExprOperation::apply_match - starting pattern match"
-        );
-
+    /// Top-level: walk the pattern against the trie from the current
+    /// zipper position, collecting all matched paths.
+    fn walk_pattern(&self, wz: &mut WriteZipperTracked<H>, matched_paths: &mut Vec<Vec<u8>>) {
         let mut references: Vec<usize> = Vec::new();
-        let mut match_count = 0usize;
-
-        self.match_item(wz, 0, &mut references, &mut match_count);
-
-        self.match_counter.fetch_add(match_count, Ordering::Relaxed);
-
-        debug!(
-            name = %self.name,
-            match_count,
-            total_matches = self.match_counter.load(Ordering::Relaxed),
-            "SExprOperation::apply_match complete"
-        );
+        self.walk_item(wz, 0, &mut references, matched_paths);
     }
 
     /// Match a single expression item starting at `expr_offset` against
-    /// the current trie position. After matching, continues with whatever
-    /// is at `expr_offset + item_size`.
-    ///
-    /// When the entire expression is consumed (expr_offset >= data.len()),
-    /// a match is recorded.
-    fn match_item(
+    /// the current trie position.
+    fn walk_item(
         &self,
         wz: &mut WriteZipperTracked<H>,
         expr_offset: usize,
         references: &mut Vec<usize>,
-        match_count: &mut usize,
+        matched_paths: &mut Vec<Vec<u8>>,
     ) {
-        let data = &self.expr_data;
+        let data = &self.pattern;
         if expr_offset >= data.len() {
-            // Full expression matched
-            *match_count += 1;
-            trace!(
-                name = %self.name,
-                match_count = *match_count,
-                "pattern matched"
-            );
+            // Full pattern matched — record the matched trie path
+            matched_paths.push(wz.path().to_vec());
             return;
         }
 
         let tag = byte_item(data[expr_offset]);
         match tag {
             Tag::NewVar => {
-                // Variable matches any item in the trie at this position.
-                // Record the current path length for co-referential binding.
                 let ref_idx = references.len();
                 references.push(wz.path().len());
 
-                // Enumerate all children at this trie position
                 let cm = wz.child_mask();
                 let mut it = cm.iter();
                 while let Some(b) = it.next() {
                     let child_tag = byte_item(b);
                     match child_tag {
                         Tag::SymbolSize(size) => {
-                            // Symbol: descend to tag byte, then enumerate
-                            // all size-byte paths manually
                             wz.descend_to_byte(b);
                             if wz.path_exists() {
                                 self.enumerate_k_paths(
@@ -274,34 +321,22 @@ impl<H: AtomHeader> SExprOperation<H> {
                                     size as usize,
                                     expr_offset + 1,
                                     references,
-                                    match_count,
+                                    matched_paths,
                                 );
                             }
                             wz.ascend_byte();
                         }
                         Tag::Arity(_) => {
-                            // Arity node: descend to tag byte, then match
-                            // `a` children (consuming `a` items from the
-                            // wildcard's perspective — but since NewVar
-                            // matches a SINGLE complete item, we need to
-                            // skip over the entire arity subtree.
                             wz.descend_to_byte(b);
                             if wz.path_exists() {
-                                // For a wildcard matching an arity node,
-                                // we need to traverse past the entire
-                                // sub-expression. We do this by continuing
-                                // the match from the next expression position
-                                // (expr_offset + 1) which is what follows
-                                // the NewVar.
-                                self.match_item(wz, expr_offset + 1, references, match_count);
+                                self.walk_item(wz, expr_offset + 1, references, matched_paths);
                             }
                             wz.ascend_byte();
                         }
                         _ => {
-                            // NewVar or VarRef bytes in the trie data
                             wz.descend_to_byte(b);
                             if wz.path_exists() {
-                                self.match_item(wz, expr_offset + 1, references, match_count);
+                                self.walk_item(wz, expr_offset + 1, references, matched_paths);
                             }
                             wz.ascend_byte();
                         }
@@ -312,7 +347,6 @@ impl<H: AtomHeader> SExprOperation<H> {
             }
 
             Tag::VarRef(k) => {
-                // Re-match the bytes captured at reference k.
                 if (k as usize) < references.len() {
                     let ref_path_start = references[k as usize];
                     let current_path = wz.path().to_vec();
@@ -321,7 +355,7 @@ impl<H: AtomHeader> SExprOperation<H> {
                         let bound_copy = current_path[ref_path_start..].to_vec();
                         wz.descend_to(&bound_copy);
                         if wz.path_exists() {
-                            self.match_item(wz, expr_offset + 1, references, match_count);
+                            self.walk_item(wz, expr_offset + 1, references, matched_paths);
                         }
                         wz.ascend(bound_copy.len());
                     }
@@ -336,23 +370,21 @@ impl<H: AtomHeader> SExprOperation<H> {
             }
 
             Tag::SymbolSize(size) => {
-                // Concrete symbol: must match exactly in the trie.
                 let symbol_byte = data[expr_offset];
                 let symbol_data_start = expr_offset + 1;
                 let symbol_data_end = symbol_data_start + size as usize;
 
                 if symbol_data_end > data.len() {
-                    return; // Malformed expression
+                    return;
                 }
 
                 let symbol_bytes = &data[symbol_data_start..symbol_data_end];
 
-                // Descend: first the tag byte, then the symbol bytes
                 wz.descend_to_byte(symbol_byte);
                 if wz.path_exists() {
                     wz.descend_to(symbol_bytes);
                     if wz.path_exists() {
-                        self.match_item(wz, symbol_data_end, references, match_count);
+                        self.walk_item(wz, symbol_data_end, references, matched_paths);
                     }
                     wz.ascend(size as usize);
                 }
@@ -360,12 +392,10 @@ impl<H: AtomHeader> SExprOperation<H> {
             }
 
             Tag::Arity(arity) => {
-                // Concrete arity: must match exactly in the trie.
                 let arity_byte = data[expr_offset];
                 wz.descend_to_byte(arity_byte);
                 if wz.path_exists() {
-                    // Recursively match `arity` children
-                    self.match_arity_children(wz, expr_offset + 1, arity, references, match_count);
+                    self.walk_arity_children(wz, expr_offset + 1, arity, references, matched_paths);
                 }
                 wz.ascend_byte();
             }
@@ -373,31 +403,25 @@ impl<H: AtomHeader> SExprOperation<H> {
     }
 
     /// Match `remaining` children of an arity node sequentially.
-    ///
-    /// Each child is matched by calling `match_item`, which advances the
-    /// expression offset past the matched child. After all children are
-    /// matched, continues with `match_item` at the post-children offset.
-    fn match_arity_children(
+    fn walk_arity_children(
         &self,
         wz: &mut WriteZipperTracked<H>,
         expr_offset: usize,
         remaining: u8,
         references: &mut Vec<usize>,
-        match_count: &mut usize,
+        matched_paths: &mut Vec<Vec<u8>>,
     ) {
         if remaining == 0 {
-            // All children matched — continue with whatever follows
-            self.match_item(wz, expr_offset, references, match_count);
+            self.walk_item(wz, expr_offset, references, matched_paths);
             return;
         }
 
-        let data = &self.expr_data;
+        let data = &self.pattern;
         if expr_offset >= data.len() {
             return;
         }
 
-        // Get the size of the current child item
-        let child_size = self.expr_item_size(expr_offset);
+        let child_size = expr_item_size(data, expr_offset);
         if child_size == 0 {
             return;
         }
@@ -405,8 +429,6 @@ impl<H: AtomHeader> SExprOperation<H> {
         let next_child_offset = expr_offset + child_size;
         let tag = byte_item(data[expr_offset]);
 
-        // Match this child, and for each successful match, continue
-        // matching the remaining siblings at next_child_offset.
         match tag {
             Tag::NewVar => {
                 let ref_idx = references.len();
@@ -426,7 +448,7 @@ impl<H: AtomHeader> SExprOperation<H> {
                                     next_child_offset,
                                     remaining - 1,
                                     references,
-                                    match_count,
+                                    matched_paths,
                                 );
                             }
                             wz.ascend_byte();
@@ -434,12 +456,12 @@ impl<H: AtomHeader> SExprOperation<H> {
                         Tag::Arity(_) => {
                             wz.descend_to_byte(b);
                             if wz.path_exists() {
-                                self.match_arity_children(
+                                self.walk_arity_children(
                                     wz,
                                     next_child_offset,
                                     remaining - 1,
                                     references,
-                                    match_count,
+                                    matched_paths,
                                 );
                             }
                             wz.ascend_byte();
@@ -447,12 +469,12 @@ impl<H: AtomHeader> SExprOperation<H> {
                         _ => {
                             wz.descend_to_byte(b);
                             if wz.path_exists() {
-                                self.match_arity_children(
+                                self.walk_arity_children(
                                     wz,
                                     next_child_offset,
                                     remaining - 1,
                                     references,
-                                    match_count,
+                                    matched_paths,
                                 );
                             }
                             wz.ascend_byte();
@@ -471,12 +493,12 @@ impl<H: AtomHeader> SExprOperation<H> {
                         let bound_copy = current_path[ref_path_start..].to_vec();
                         wz.descend_to(&bound_copy);
                         if wz.path_exists() {
-                            self.match_arity_children(
+                            self.walk_arity_children(
                                 wz,
                                 next_child_offset,
                                 remaining - 1,
                                 references,
-                                match_count,
+                                matched_paths,
                             );
                         }
                         wz.ascend(bound_copy.len());
@@ -497,12 +519,12 @@ impl<H: AtomHeader> SExprOperation<H> {
                 if wz.path_exists() {
                     wz.descend_to(symbol_bytes);
                     if wz.path_exists() {
-                        self.match_arity_children(
+                        self.walk_arity_children(
                             wz,
                             next_child_offset,
                             remaining - 1,
                             references,
-                            match_count,
+                            matched_paths,
                         );
                     }
                     wz.ascend(size as usize);
@@ -514,19 +536,14 @@ impl<H: AtomHeader> SExprOperation<H> {
                 let arity_byte = data[expr_offset];
                 wz.descend_to_byte(arity_byte);
                 if wz.path_exists() {
-                    // Match the sub-arity's children, then continue with
-                    // the remaining siblings. We "inline" the sub-arity
-                    // children into the remaining count: after matching
-                    // sub_arity inner children, we continue with
-                    // (remaining - 1) outer siblings.
-                    self.match_nested_then_siblings(
+                    self.walk_nested_then_siblings(
                         wz,
                         expr_offset + 1,
                         sub_arity,
                         next_child_offset,
                         remaining - 1,
                         references,
-                        match_count,
+                        matched_paths,
                     );
                 }
                 wz.ascend_byte();
@@ -536,7 +553,7 @@ impl<H: AtomHeader> SExprOperation<H> {
 
     /// Match `inner_remaining` children of a nested arity, then continue
     /// with `outer_remaining` siblings starting at `siblings_offset`.
-    fn match_nested_then_siblings(
+    fn walk_nested_then_siblings(
         &self,
         wz: &mut WriteZipperTracked<H>,
         expr_offset: usize,
@@ -544,25 +561,25 @@ impl<H: AtomHeader> SExprOperation<H> {
         siblings_offset: usize,
         outer_remaining: u8,
         references: &mut Vec<usize>,
-        match_count: &mut usize,
+        matched_paths: &mut Vec<Vec<u8>>,
     ) {
         if inner_remaining == 0 {
-            self.match_arity_children(
+            self.walk_arity_children(
                 wz,
                 siblings_offset,
                 outer_remaining,
                 references,
-                match_count,
+                matched_paths,
             );
             return;
         }
 
-        let data = &self.expr_data;
+        let data = &self.pattern;
         if expr_offset >= data.len() {
             return;
         }
 
-        let child_size = self.expr_item_size(expr_offset);
+        let child_size = expr_item_size(data, expr_offset);
         if child_size == 0 {
             return;
         }
@@ -591,7 +608,7 @@ impl<H: AtomHeader> SExprOperation<H> {
                                     siblings_offset,
                                     outer_remaining,
                                     references,
-                                    match_count,
+                                    matched_paths,
                                 );
                             }
                             wz.ascend_byte();
@@ -599,14 +616,14 @@ impl<H: AtomHeader> SExprOperation<H> {
                         Tag::Arity(_) | _ => {
                             wz.descend_to_byte(b);
                             if wz.path_exists() {
-                                self.match_nested_then_siblings(
+                                self.walk_nested_then_siblings(
                                     wz,
                                     next_offset,
                                     inner_remaining - 1,
                                     siblings_offset,
                                     outer_remaining,
                                     references,
-                                    match_count,
+                                    matched_paths,
                                 );
                             }
                             wz.ascend_byte();
@@ -625,14 +642,14 @@ impl<H: AtomHeader> SExprOperation<H> {
                         let bound_copy = current_path[ref_path_start..].to_vec();
                         wz.descend_to(&bound_copy);
                         if wz.path_exists() {
-                            self.match_nested_then_siblings(
+                            self.walk_nested_then_siblings(
                                 wz,
                                 next_offset,
                                 inner_remaining - 1,
                                 siblings_offset,
                                 outer_remaining,
                                 references,
-                                match_count,
+                                matched_paths,
                             );
                         }
                         wz.ascend(bound_copy.len());
@@ -653,14 +670,14 @@ impl<H: AtomHeader> SExprOperation<H> {
                 if wz.path_exists() {
                     wz.descend_to(symbol_bytes);
                     if wz.path_exists() {
-                        self.match_nested_then_siblings(
+                        self.walk_nested_then_siblings(
                             wz,
                             next_offset,
                             inner_remaining - 1,
                             siblings_offset,
                             outer_remaining,
                             references,
-                            match_count,
+                            matched_paths,
                         );
                     }
                     wz.ascend(size as usize);
@@ -672,16 +689,14 @@ impl<H: AtomHeader> SExprOperation<H> {
                 let arity_byte = data[expr_offset];
                 wz.descend_to_byte(arity_byte);
                 if wz.path_exists() {
-                    // Flatten: the sub_arity children are added to the
-                    // inner_remaining - 1 count for the current nesting
-                    self.match_nested_then_siblings(
+                    self.walk_nested_then_siblings(
                         wz,
                         expr_offset + 1,
                         sub_arity + (inner_remaining - 1),
                         siblings_offset,
                         outer_remaining,
                         references,
-                        match_count,
+                        matched_paths,
                     );
                 }
                 wz.ascend_byte();
@@ -689,21 +704,22 @@ impl<H: AtomHeader> SExprOperation<H> {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // k-path enumeration helpers
+    // -----------------------------------------------------------------------
+
     /// Enumerate all k-byte paths at the current trie position, and for
     /// each one, continue matching at `continuation_offset`.
-    ///
-    /// This replaces `descend_first_k_path` / `to_next_k_path` from
-    /// `ZipperIteration` which is not available on `WriteZipperTracked`.
     fn enumerate_k_paths(
         &self,
         wz: &mut WriteZipperTracked<H>,
         k: usize,
         continuation_offset: usize,
         references: &mut Vec<usize>,
-        match_count: &mut usize,
+        matched_paths: &mut Vec<Vec<u8>>,
     ) {
         if k == 0 {
-            self.match_item(wz, continuation_offset, references, match_count);
+            self.walk_item(wz, continuation_offset, references, matched_paths);
             return;
         }
 
@@ -712,7 +728,7 @@ impl<H: AtomHeader> SExprOperation<H> {
         while let Some(b) = it.next() {
             wz.descend_to_byte(b);
             if wz.path_exists() {
-                self.enumerate_k_paths(wz, k - 1, continuation_offset, references, match_count);
+                self.enumerate_k_paths(wz, k - 1, continuation_offset, references, matched_paths);
             }
             wz.ascend_byte();
         }
@@ -726,15 +742,15 @@ impl<H: AtomHeader> SExprOperation<H> {
         siblings_offset: usize,
         remaining_siblings: u8,
         references: &mut Vec<usize>,
-        match_count: &mut usize,
+        matched_paths: &mut Vec<Vec<u8>>,
     ) {
         if k == 0 {
-            self.match_arity_children(
+            self.walk_arity_children(
                 wz,
                 siblings_offset,
                 remaining_siblings,
                 references,
-                match_count,
+                matched_paths,
             );
             return;
         }
@@ -750,7 +766,7 @@ impl<H: AtomHeader> SExprOperation<H> {
                     siblings_offset,
                     remaining_siblings,
                     references,
-                    match_count,
+                    matched_paths,
                 );
             }
             wz.ascend_byte();
@@ -768,17 +784,17 @@ impl<H: AtomHeader> SExprOperation<H> {
         siblings_offset: usize,
         outer_remaining: u8,
         references: &mut Vec<usize>,
-        match_count: &mut usize,
+        matched_paths: &mut Vec<Vec<u8>>,
     ) {
         if k == 0 {
-            self.match_nested_then_siblings(
+            self.walk_nested_then_siblings(
                 wz,
                 inner_offset,
                 inner_remaining,
                 siblings_offset,
                 outer_remaining,
                 references,
-                match_count,
+                matched_paths,
             );
             return;
         }
@@ -796,46 +812,49 @@ impl<H: AtomHeader> SExprOperation<H> {
                     siblings_offset,
                     outer_remaining,
                     references,
-                    match_count,
+                    matched_paths,
                 );
             }
             wz.ascend_byte();
         }
     }
+}
 
-    /// Compute the byte size of the expression item at `offset`.
-    ///
-    /// Returns the total number of bytes consumed by this item in the
-    /// expression encoding:
-    /// - `NewVar`: 1 byte
-    /// - `VarRef(_)`: 1 byte
-    /// - `SymbolSize(n)`: 1 + n bytes
-    /// - `Arity(a)`: 1 + sum of sizes of `a` children
-    fn expr_item_size(&self, offset: usize) -> usize {
-        let data = &self.expr_data;
-        if offset >= data.len() {
-            return 0;
-        }
-        match byte_item(data[offset]) {
-            Tag::NewVar => 1,
-            Tag::VarRef(_) => 1,
-            Tag::SymbolSize(n) => 1 + n as usize,
-            Tag::Arity(a) => {
-                let mut size = 1;
-                for _ in 0..a {
-                    let child_size = self.expr_item_size(offset + size);
-                    if child_size == 0 {
-                        return 0;
-                    }
-                    size += child_size;
+// ---------------------------------------------------------------------------
+// Free function: compute the byte size of an expression item in a byte slice
+// ---------------------------------------------------------------------------
+
+/// Compute the byte size of the expression item at `offset` in `data`.
+///
+/// Returns the total number of bytes consumed by this item:
+/// - `NewVar`: 1 byte
+/// - `VarRef(_)`: 1 byte
+/// - `SymbolSize(n)`: 1 + n bytes
+/// - `Arity(a)`: 1 + sum of sizes of `a` children
+fn expr_item_size(data: &[u8], offset: usize) -> usize {
+    if offset >= data.len() {
+        return 0;
+    }
+    match byte_item(data[offset]) {
+        Tag::NewVar => 1,
+        Tag::VarRef(_) => 1,
+        Tag::SymbolSize(n) => 1 + n as usize,
+        Tag::Arity(a) => {
+            let mut size = 1;
+            for _ in 0..a {
+                let child_size = expr_item_size(data, offset + size);
+                if child_size == 0 {
+                    return 0;
                 }
-                size
+                size += child_size;
             }
+            size
         }
     }
 }
 
-// Safety: expr_data is Vec<u8> (owned, no raw pointers shared), mode is an enum.
+// Safety: all fields are owned (Vec<u8>, String, Arc<AtomicUsize>, PhantomData).
+// No raw pointers are shared.
 unsafe impl<H: AtomHeader> Send for SExprOperation<H> {}
 unsafe impl<H: AtomHeader> Sync for SExprOperation<H> {}
 
@@ -844,11 +863,40 @@ impl<H: AtomHeader + Default> TransformOp<H> for SExprOperation<H> {
         &self.name
     }
 
-    fn apply(&self, wz: &mut WriteZipperTracked<H>) {
-        match &self.mode {
-            SExprMode::Add => self.apply_add(wz),
-            SExprMode::Remove => self.apply_remove(wz),
-            SExprMode::Match => self.apply_match(wz),
+    fn apply(&self, wz: &mut WriteZipperTracked<H>, atom_path: &[u8]) {
+        trace!(
+            name = %self.name,
+            atom_path_len = atom_path.len(),
+            pattern_len = self.pattern.len(),
+            template_count = self.templates.len(),
+            "SExprOperation::apply"
+        );
+
+        // Empty pattern: apply templates unconditionally (no matching)
+        if self.pattern.is_empty() {
+            self.match_counter.fetch_add(1, Ordering::Relaxed);
+            self.apply_templates_direct(wz);
+            return;
+        }
+
+        // Phase 1: Walk the trie to find all paths matching the pattern
+        let mut matched_paths: Vec<Vec<u8>> = Vec::new();
+        self.walk_pattern(wz, &mut matched_paths);
+        wz.reset();
+
+        let match_count = matched_paths.len();
+        self.match_counter.fetch_add(match_count, Ordering::Relaxed);
+
+        debug!(
+            name = %self.name,
+            match_count,
+            total_matches = self.match_counter.load(Ordering::Relaxed),
+            "pattern walk complete"
+        );
+
+        // Phase 2+3+4: For each match, extract bindings and instantiate templates
+        for matched_data in &matched_paths {
+            self.apply_templates(wz, matched_data);
         }
     }
 }

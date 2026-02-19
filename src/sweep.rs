@@ -335,7 +335,7 @@ where
                                         // Catch panics to prevent thread death
                                         let result = std::panic::catch_unwind(
                                             std::panic::AssertUnwindSafe(|| {
-                                                op.apply(&mut wz);
+                                                op.apply(&mut wz, &atom_path);
                                             }),
                                         );
 

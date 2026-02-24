@@ -1,5 +1,5 @@
 use crate::sweep::AtomHeader;
-use pathmap::zipper::{ZipperHeadOwned, ZipperValues};
+use pathmap::zipper::{Zipper, ZipperCreation, ZipperHeadOwned, ZipperValues, ZipperWriting};
 use std::{ops::Deref, sync::Arc};
 
 /// A thread-safe wrapper around PathMap's ZipperHeadOwned for managing weighted atoms.
@@ -32,7 +32,6 @@ where
     H: AtomHeader,
 {
     pub fn get_val(&self, path: &[u8]) -> Option<H> {
-        use pathmap::zipper::{Zipper, ZipperCreation};
         match self.inner.read_zipper_at_path(path) {
             Ok(z) => z.val().cloned(),
             Err(_) => None,
@@ -40,7 +39,6 @@ where
     }
 
     pub fn set_weighted_val(&self, path: &[u8], val: H) -> Result<(), ()> {
-        use pathmap::zipper::{Zipper, ZipperCreation, ZipperWriting};
         if let Ok(mut z) = self.inner.write_zipper_at_exclusive_path(path) {
             z.set_val(val);
             Ok(())

@@ -138,7 +138,7 @@ where
 {
     processes: Vec<SweepProcess<H>>,
     settings: WeightedAtomSweepSettings,
-    map: WeightedMap<H>,
+    pub map: WeightedMap<H>,
 }
 
 impl<H> WeightedAtomSweep<H>

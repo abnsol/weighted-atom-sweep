@@ -210,6 +210,9 @@ where
             let map_for_operations = self.map.inner.clone();
             let shutdown_traversal = shutdown.clone();
             let shutdown_operations = shutdown.clone();
+            let pause_flag = Arc::new(AtomicBool::new(false));
+            let pause_for_traversal = pause_flag.clone();
+            let pause_for_operations = pause_flag.clone();
 
             // Create channel for this process
             let (atom_sender, atom_receiver) = mpsc::channel::<AtomPosition>();
@@ -237,6 +240,19 @@ where
                             process_idx,
                             "shutdown signal received, exiting traversal loop"
                         );
+                        break;
+                    }
+
+                    // Check pause flag - if operations has a conflict, wait before sampling
+                    while pause_for_traversal.load(Ordering::Relaxed) {
+                        if shutdown_traversal.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+
+                    // Check shutdown again after pause
+                    if shutdown_traversal.load(Ordering::Relaxed) {
                         break;
                     }
 
@@ -303,78 +319,120 @@ where
                     operation_count, "operations thread started - entering processing loop"
                 );
 
+                let mut buffer: Vec<AtomPosition> = Vec::new();
+
                 loop {
-                    match atom_receiver.recv() {
-                        Ok(atom_path) => {
-                            debug!(
-                                process_idx,
-                                atom_path_len = atom_path.len(),
-                                operation_count,
-                                "processing atom with operations"
-                            );
+                    // Try to receive new atom from traversal (non-blocking)
+                    if let Ok(atom_path) = atom_receiver.try_recv() {
+                        debug!(
+                            process_idx,
+                            atom_path_len = atom_path.len(),
+                            operation_count,
+                            "received atom from traversal, pushing to buffer"
+                        );
+                        buffer.push(atom_path);
+                    }
 
-                            // Acquire a write zipper at the atom's position.
-                            // This gives exclusive write access to the subtrie at
-                            // and below atom_path. The zipper's root IS atom_path,
-                            // so ascend() returns false at this boundary.
-                            match map_for_operations.write_zipper_at_exclusive_path(&atom_path[..])
-                            {
-                                Ok(mut wz) => {
-                                    for (idx, op) in operations.iter().enumerate() {
-                                        let op_span = span!(
-                                            Level::TRACE,
-                                            "operation",
-                                            process_idx,
-                                            operation_idx = idx,
-                                            name = op.name()
-                                        );
-                                        let _op_enter = op_span.enter();
+                    // Process buffer in FIFO order
+                    let mut made_progress = false;
+                    let mut i = 0;
+                    while i < buffer.len() {
+                        let atom_path = &buffer[i];
 
-                                        trace!(process_idx, "executing operation");
+                        debug!(
+                            process_idx,
+                            atom_path_len = atom_path.len(),
+                            operation_count,
+                            "processing atom from buffer"
+                        );
 
-                                        // Catch panics to prevent thread death
-                                        let result = std::panic::catch_unwind(
-                                            std::panic::AssertUnwindSafe(|| {
-                                                op.apply(&mut wz, &atom_path);
-                                            }),
-                                        );
+                        // Acquire a write zipper at the atom's position.
+                        // This gives exclusive write access to the subtrie at
+                        // and below atom_path. The zipper's root IS atom_path,
+                        // so ascend() returns false at this boundary.
+                        match map_for_operations.write_zipper_at_exclusive_path(&atom_path[..]) {
+                            Ok(mut wz) => {
+                                for (idx, op) in operations.iter().enumerate() {
+                                    let op_span = span!(
+                                        Level::TRACE,
+                                        "operation",
+                                        process_idx,
+                                        operation_idx = idx,
+                                        name = op.name()
+                                    );
+                                    let _op_enter = op_span.enter();
 
-                                        if let Err(e) = result {
-                                            trace!(process_idx, "operation panicked: {:?}", e);
-                                        } else {
-                                            trace!(process_idx, "operation completed");
-                                        }
+                                    trace!(process_idx, "executing operation");
 
-                                        // Reset the write zipper to the focus root
-                                        // between operations so each starts at the
-                                        // same position
-                                        wz.reset();
+                                    // Catch panics to prevent thread death
+                                    let result = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| {
+                                            op.apply(&mut wz, atom_path);
+                                        }),
+                                    );
+
+                                    if let Err(e) = result {
+                                        trace!(process_idx, "operation panicked: {:?}", e);
+                                    } else {
+                                        trace!(process_idx, "operation completed");
                                     }
 
-                                    // Cleanup the write zipper: drops it and prunes
-                                    // any dangling path nodes created by the exclusive
-                                    // path mechanism
-                                    map_for_operations.cleanup_write_zipper(wz);
+                                    // Reset the write zipper to the focus root
+                                    // between operations so each starts at the
+                                    // same position
+                                    wz.reset();
+                                }
 
-                                    debug!(process_idx, "all operations completed for atom");
-                                }
-                                Err(conflict) => {
-                                    // Another process may hold a conflicting zipper.
-                                    // Skip this atom and continue processing.
-                                    trace!(
-                                        process_idx,
-                                        "write zipper conflict for atom, skipping: {:?}",
-                                        conflict
-                                    );
-                                }
+                                // Cleanup the write zipper: drops it and prunes
+                                // any dangling path nodes created by the exclusive
+                                // path mechanism
+                                map_for_operations.cleanup_write_zipper(wz);
+
+                                debug!(process_idx, "all operations completed for atom");
+                                buffer.remove(i);
+                                made_progress = true;
+                            }
+                            Err(conflict) => {
+                                // Another process may hold a conflicting zipper.
+                                // Set pause flag to slow down traversal, keep in buffer.
+                                trace!(
+                                    process_idx,
+                                    "write zipper conflict for atom, pausing traversal: {:?}",
+                                    conflict
+                                );
+                                pause_for_operations.store(true, Ordering::Relaxed);
+                                i += 1;
                             }
                         }
-                        Err(_) => {
-                            debug!(
-                                process_idx,
-                                "traversal complete - channel closed, no more atoms"
-                            );
-                            break;
+                    }
+
+                    // Clear pause flag only if buffer is empty
+                    if buffer.is_empty() {
+                        pause_for_operations.store(false, Ordering::Relaxed);
+                    }
+
+                    // If we couldn't make progress (all conflicts), sleep before retry
+                    if !made_progress && !buffer.is_empty() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+
+                    // Check if traversal has ended and buffer is empty
+                    if buffer.is_empty() {
+                        // Use try_recv to check if channel is disconnected
+                        match atom_receiver.try_recv() {
+                            Ok(atom_path) => {
+                                buffer.push(atom_path);
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                debug!(
+                                    process_idx,
+                                    "traversal complete - channel closed, buffer empty, exiting"
+                                );
+                                break;
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {
+                                // Channel still open but no new messages, continue
+                            }
                         }
                     }
                 }

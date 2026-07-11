@@ -1,5 +1,5 @@
 use crate::sweep::AtomPosition;
-use crate::traversal::{TraversalError, TraversalEngine, node_agg_w_fallible};
+use crate::traversal::{TraversalError, TraversalEngine};
 use pathmap::zipper::{ReadZipperTracked, ReadZipperUntracked, ZipperIteration, ZipperForking, ZipperAbsolutePath};
 use std::sync::{Arc, Mutex};
 use std::collections::BinaryHeap;
@@ -34,13 +34,9 @@ impl PartialOrd for AtomChunk {
 
 /// A chunked priority queue traversal engine.
 ///
-/// Collects subtree chunks at a fixed depth, scores them by `agg_w`,
-/// and serves them from a max-heap. This biases sampling toward heavier
-/// subtrees while maintaining spatial locality.
-///
-/// Note: this implementation scores chunks using `node_agg_w_fallible`
-/// (full catamorphism per chunk). The O(1) stored-field read is preferred
-/// in production — see B1.
+/// Collects subtree chunks at a fixed depth, scores them by stored `agg_w`
+/// (O(1) per chunk), and serves them from a max-heap. This biases sampling
+/// toward heavier subtrees while maintaining spatial locality.
 pub struct ChunkedPQTraverse {
     heap: Arc<Mutex<BinaryHeap<AtomChunk>>>,
     depth: usize,
@@ -75,8 +71,7 @@ impl ChunkedPQTraverse {
     ) {
         if z.descend_first_k_path(target_depth) {
             loop {
-                // was: node_agg_w_fallible — full catamorphism per chunk
-                let score = node_agg_w_fallible(z.fork_read_zipper()).unwrap_or(0);
+                let score = z.agg_w();
                 heap.lock().unwrap().push(AtomChunk {
                     path: z.origin_path().to_vec(),
                     score,

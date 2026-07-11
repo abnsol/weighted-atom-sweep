@@ -34,6 +34,12 @@ pub trait TraversalEngine: Send + Sync + 'static {
 /// Aggregates all values in the subtrie by summing them from leaves to root.
 /// Use as a test oracle to validate that stored `agg_w` values are correct.
 /// In production, prefer `zipper.agg_w()` which reads the O(1) stored field.
+///
+/// # Oracle contract
+///
+/// For any trie mutated exclusively via `set_val_w` / `remove_val_w`,
+/// `node_agg_w(z)` MUST equal `z.agg_w()` at every position. The
+/// `agg_w_parity` test enforces this invariant.
 pub fn node_agg_w<Z: Catamorphism<u64>>(path: Z) -> Result<u64, TraversalError> {
     node_agg_w_fallible(path)
         .map_err(|_| TraversalError {

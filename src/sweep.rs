@@ -389,7 +389,8 @@ impl WeightedAtomSweep {
                     }
 
                     if !sampled {
-                        std::thread::yield_now();
+                        // Backoff to avoid spinning 100% CPU when sampling fails
+                        std::thread::sleep(Duration::from_millis(10));
                     }
                 }
                 debug!("traversal thread completed");
@@ -570,6 +571,9 @@ impl WeightedAtomSweep {
             guard.take().expect("map was already leased or is missing")
         };
 
+        // Clear self.map reference so that the Arc strong count drops to 1 for unwrap
+        self.map = None;
+
         debug_assert_eq!(
             Arc::strong_count(&map_arc),
             1,
@@ -580,7 +584,6 @@ impl WeightedAtomSweep {
             .expect("failed to reclaim leased trie: references still held");
 
         let path_map = zipper_head.into_map();
-        self.map = None;
 
         debug!("sweep pause_all completed successfully");
         path_map
@@ -619,26 +622,35 @@ impl WeightedAtomSweep {
 
     /// Shutdown a specific controller by name and reclaim its trie.
     pub fn shutdown(&mut self, name: &str) -> Option<PathMap<u64>> {
-        if let Some(ctrl) = self.controllers.remove(name) {
+        if let Some(mut ctrl) = self.controllers.remove(name) {
             debug!(name, "shutting down sweep controller");
-            // Take ownership and shutdown — Drop will clean up threads
-            // Then try to reclaim the trie from the shared slot
-            if self.controllers.is_empty() {
-                // Last controller — reclaim the trie
+            let is_last = self.controllers.is_empty();
+
+            let mut map_arc = None;
+            if is_last {
+                // Take Arc and clear self.map before joining threads to allow try_unwrap to succeed
+                self.map = None;
                 if let Ok(mut guard) = ctrl.map.write() {
-                    if let Some(arc) = guard.take() {
-                        if let Ok(head) = Arc::try_unwrap(arc) {
-                            let map = head.into_map();
-                            self.map = Some(WeightedMap {
-                                inner: Arc::new(PathMap::<u64>::new().into_zipper_head([])),
-                            });
-                            return Some(map);
-                        }
-                    }
+                    map_arc = guard.take();
                 }
             }
-            // Force shutdown
-            drop(ctrl);
+
+            // Signal shutdown and join all threads to ensure references are released
+            ctrl.shutdown_signal.store(true, Ordering::SeqCst);
+            ctrl.paused_signal.store(false, Ordering::SeqCst);
+            for handle in ctrl.handles.drain(..) {
+                let _ = handle.join();
+            }
+
+            if let Some(arc) = map_arc {
+                if let Ok(head) = Arc::try_unwrap(arc) {
+                    let map = head.into_map();
+                    self.map = Some(WeightedMap {
+                        inner: Arc::new(PathMap::<u64>::new().into_zipper_head([])),
+                    });
+                    return Some(map);
+                }
+            }
         }
         None
     }

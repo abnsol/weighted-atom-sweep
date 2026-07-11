@@ -104,7 +104,10 @@ impl TraversalEngine for ChunkedPQTraverse {
         match h.pop() {
             Some(chunk) => Ok(chunk.path),
             None => {
-                Ok(z.origin_path().to_vec())
+                // Return error on empty trie to avoid returning root path and causing lock contention.
+                Err(TraversalError {
+                    message: "Trie is empty or has no atoms at specified depth".to_string(),
+                })
             }
         }
     }

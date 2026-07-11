@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 tracing = "0.1"
+rand = "0.9"
 
 [dependencies.pathmap]
 # TODO: use git and pin to a version

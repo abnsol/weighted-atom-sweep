@@ -14,23 +14,26 @@
 //! - Full sweep loop integration
 //! - Encoding verification
 
+use std::time::Duration;
+
 use mork_expr::{item_byte, parse, Tag};
-use pathmap::zipper::{Zipper, ZipperCreation};
+use pathmap::zipper::{ReadZipperTracked, ZipperCreation};
 use pathmap::PathMap;
 
 use weighted_atom_sweep::{
-    AtomHeader, Operation, OperationObserver, SExprOperation, TemplateEffect, TransformOp,
-    TraversalEngine, WeightedAtomSweep, WeightedAtomSweepSettings,
+    AtomPosition, Operation, OperationObserver, SExprOperation, TemplateEffect,
+    TransformOp, TraversalEngine, TraversalError, WeightedAtomSweep, WeightedAtomSweepSettings,
 };
 
-// ---------------------------------------------------------------------------
-// Shared Header type
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Default)]
-pub struct Header;
-
-impl AtomHeader for Header {}
+/// A no-op engine that always returns the root path (used by the sweep-loop test).
+struct FixedRoot;
+impl TraversalEngine for FixedRoot {
+    fn name(&self) -> &str { "fixed_root" }
+    fn next_atom(&self, _z: ReadZipperTracked<u64>) -> Result<AtomPosition, TraversalError> {
+        std::thread::sleep(Duration::from_millis(500));
+        Ok(vec![])
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helper: encode expressions with parse! and return byte vecs
@@ -84,10 +87,10 @@ fn test_exec_no_pattern_add() {
         .try_init();
 
     let expr_bytes = expr_foo_bar();
-    let space = PathMap::<Header>::new().into_zipper_head([]);
+    let space = PathMap::<u64>::new().into_zipper_head([]);
 
     let op =
-        SExprOperation::<Header>::exec("add_foo_bar", &[], &[(&expr_bytes, TemplateEffect::Add)]);
+        SExprOperation::exec("add_foo_bar", &[], &[(&expr_bytes, TemplateEffect::Add)]);
 
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
@@ -115,13 +118,13 @@ fn test_exec_no_pattern_remove() {
 
     let expr_bytes = expr_foo_bar();
 
-    let mut map = PathMap::<Header>::new();
-    map.set_val_at(&expr_bytes, Header);
+    let mut map = PathMap::<u64>::new();
+    map.set_val_at(&expr_bytes, 1u64);
     assert!(map.get_val_at(&expr_bytes).is_some());
 
     let space = map.into_zipper_head([]);
 
-    let op = SExprOperation::<Header>::exec(
+    let op = SExprOperation::exec(
         "remove_foo_bar",
         &[],
         &[(&expr_bytes, TemplateEffect::Remove)],
@@ -154,15 +157,15 @@ fn test_exec_match_only() {
         .with_test_writer()
         .try_init();
 
-    let mut map = PathMap::<Header>::new();
-    map.set_val_at(&expr_eq_a_a(), Header);
-    map.set_val_at(&expr_eq_b_b(), Header);
-    map.set_val_at(&expr_eq_a_b(), Header);
+    let mut map = PathMap::<u64>::new();
+    map.set_val_at(&expr_eq_a_a(), 1u64);
+    map.set_val_at(&expr_eq_b_b(), 1u64);
+    map.set_val_at(&expr_eq_a_b(), 1u64);
 
     let space = map.into_zipper_head([]);
     let pattern = pattern_eq_x_x();
 
-    let op = SExprOperation::<Header>::exec("match_eq_x_x", &pattern, &[]);
+    let op = SExprOperation::exec("match_eq_x_x", &pattern, &[]);
 
     assert_eq!(op.match_count(), 0);
 
@@ -196,17 +199,17 @@ fn test_exec_pattern_then_add() {
         .with_test_writer()
         .try_init();
 
-    let mut map = PathMap::<Header>::new();
-    map.set_val_at(&expr_eq_a_a(), Header);
-    map.set_val_at(&expr_eq_b_b(), Header);
-    map.set_val_at(&expr_eq_a_b(), Header);
+    let mut map = PathMap::<u64>::new();
+    map.set_val_at(&expr_eq_a_a(), 1u64);
+    map.set_val_at(&expr_eq_b_b(), 1u64);
+    map.set_val_at(&expr_eq_a_b(), 1u64);
 
     let space = map.into_zipper_head([]);
 
     let pattern = pattern_eq_x_x();
     let template = template_matched_x();
 
-    let op = SExprOperation::<Header>::exec(
+    let op = SExprOperation::exec(
         "match_and_add",
         &pattern,
         &[(&template, TemplateEffect::Add)],
@@ -258,10 +261,10 @@ fn test_exec_pattern_then_remove() {
         .with_test_writer()
         .try_init();
 
-    let mut map = PathMap::<Header>::new();
-    map.set_val_at(&expr_eq_a_a(), Header);
-    map.set_val_at(&expr_eq_b_b(), Header);
-    map.set_val_at(&expr_eq_a_b(), Header);
+    let mut map = PathMap::<u64>::new();
+    map.set_val_at(&expr_eq_a_a(), 1u64);
+    map.set_val_at(&expr_eq_b_b(), 1u64);
+    map.set_val_at(&expr_eq_a_b(), 1u64);
 
     let space = map.into_zipper_head([]);
 
@@ -269,7 +272,7 @@ fn test_exec_pattern_then_remove() {
     // Template is the same as pattern — removes the matched path
     let template = pattern_eq_x_x();
 
-    let op = SExprOperation::<Header>::exec(
+    let op = SExprOperation::exec(
         "match_and_remove",
         &pattern,
         &[(&template, TemplateEffect::Remove)],
@@ -317,10 +320,10 @@ fn test_exec_rewrite_rule() {
         .with_test_writer()
         .try_init();
 
-    let mut map = PathMap::<Header>::new();
-    map.set_val_at(&expr_eq_a_a(), Header);
-    map.set_val_at(&expr_eq_b_b(), Header);
-    map.set_val_at(&expr_eq_a_b(), Header);
+    let mut map = PathMap::<u64>::new();
+    map.set_val_at(&expr_eq_a_a(), 1u64);
+    map.set_val_at(&expr_eq_b_b(), 1u64);
+    map.set_val_at(&expr_eq_a_b(), 1u64);
 
     let space = map.into_zipper_head([]);
 
@@ -328,7 +331,7 @@ fn test_exec_rewrite_rule() {
     let remove_template = pattern_eq_x_x(); // remove the matched self-equal
     let add_template = template_matched_x(); // add (matched $x)
 
-    let op = SExprOperation::<Header>::exec(
+    let op = SExprOperation::exec(
         "rewrite_eq",
         &pattern,
         &[
@@ -370,13 +373,13 @@ fn test_exec_match_count_accumulates() {
         .with_test_writer()
         .try_init();
 
-    let mut map = PathMap::<Header>::new();
-    map.set_val_at(&expr_eq_a_a(), Header);
-    map.set_val_at(&expr_eq_b_b(), Header);
+    let mut map = PathMap::<u64>::new();
+    map.set_val_at(&expr_eq_a_a(), 1u64);
+    map.set_val_at(&expr_eq_b_b(), 1u64);
 
     let space = map.into_zipper_head([]);
     let pattern = pattern_eq_x_x();
-    let op = SExprOperation::<Header>::exec("match_accum", &pattern, &[]);
+    let op = SExprOperation::exec("match_accum", &pattern, &[]);
 
     // First apply
     {
@@ -418,31 +421,27 @@ fn test_exec_in_sweep_loop() {
 
     let expr_bytes = expr_foo_bar();
 
-    let mut sweep = WeightedAtomSweep::<Header>::new(WeightedAtomSweepSettings::default());
+    let mut sweep = WeightedAtomSweep::new(WeightedAtomSweepSettings::default());
 
-    let engine = TraversalEngine::new("fixed_root", |_rz| {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        Ok(vec![])
-    });
-
-    let process = sweep.add_engine(engine);
+    // Build a custom engine directly and add it under a name.
+    let process = sweep.add_engine("engine_1", "random_walk");
 
     // Subscribe an exec operation with no pattern (unconditional Add)
     let add_op =
-        SExprOperation::<Header>::exec("add_foo_bar", &[], &[(&expr_bytes, TemplateEffect::Add)]);
-    process.subscribe(add_op);
+        SExprOperation::exec("add_foo_bar", &[], &[(&expr_bytes, TemplateEffect::Add)]);
+    process.subscribe(Box::new(add_op));
 
     // Also subscribe a simple fn-pointer operation
-    let noop = Operation::<Header>::new(
+    let noop = Operation::new(
         "noop",
-        |_wz: &mut pathmap::zipper::WriteZipperTracked<Header>, _atom_path: &[u8]| {},
+        |_wz: &mut pathmap::zipper::WriteZipperTracked<u64>, _atom_path: &[u8]| {},
     );
-    process.subscribe(noop);
+    process.subscribe(Box::new(noop));
 
-    let controller = sweep.spawn();
+    let _name = sweep.spawn();
     std::thread::sleep(std::time::Duration::from_millis(2000));
-    let result = controller.shutdown();
-    assert!(result.is_ok(), "sweep shutdown should succeed");
+    let result = sweep.shutdown_all();
+    assert!(result.is_some(), "sweep shutdown should succeed");
 }
 
 // ===========================================================================
@@ -503,18 +502,18 @@ fn test_exec_with_noise() {
         .with_test_writer()
         .try_init();
 
-    let mut map = PathMap::<Header>::new();
-    map.set_val_at(&expr_eq_a_a(), Header);
-    map.set_val_at(&expr_eq_b_b(), Header);
-    map.set_val_at(&expr_eq_a_b(), Header);
-    map.set_val_at(&expr_f_ga_b(), Header); // noise
+    let mut map = PathMap::<u64>::new();
+    map.set_val_at(&expr_eq_a_a(), 1u64);
+    map.set_val_at(&expr_eq_b_b(), 1u64);
+    map.set_val_at(&expr_eq_a_b(), 1u64);
+    map.set_val_at(&expr_f_ga_b(), 1u64); // noise
 
     let space = map.into_zipper_head([]);
 
     let pattern = pattern_eq_x_x();
     let template = template_matched_x();
 
-    let op = SExprOperation::<Header>::exec(
+    let op = SExprOperation::exec(
         "match_with_noise",
         &pattern,
         &[(&template, TemplateEffect::Add)],

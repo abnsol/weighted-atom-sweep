@@ -18,11 +18,11 @@
 //!
 //! Two concrete operation types are provided:
 //!
-//! - [`Operation<H>`] — a stateless function pointer for simple transforms
-//! - [`SExprOperation<H>`] — an mm2 exec operation that pattern-matches against
+//! - [`Operation`] — a stateless function pointer for simple transforms
+//! - [`SExprOperation`] — an mm2 exec operation that pattern-matches against
 //!   the subtrie and instantiates templates with variable bindings
 //!
-//! Both implement the [`TransformOp<H>`] trait and can be mixed freely within a
+//! Both implement the [`TransformOp`] trait and can be mixed freely within a
 //! single [`SweepProcess`].
 //!
 //! ## mm2 Exec Operations
@@ -75,56 +75,6 @@
 //! }
 //! ```
 //!
-//! ## Tracing Hierarchy
-//!
-//! The crate uses a hierarchical naming convention for spans:
-//!
-//! ```text
-//! sweep.*                    - WeightedAtomSweep operations
-//! ├── sweep.new              - Initialization
-//! ├── sweep.spawn            - Thread spawning and orchestration
-//! │   ├── traversal_thread   - Atom traversal operations
-//! │   └── operations_thread  - Operation execution (write zipper acquisition)
-//! │       └── operation      - Individual operation execution
-//! ├── sweep.subscribe        - Operation subscription
-//! └── sweep.unsubscribe      - Operation unsubscription
-//!
-//! traversal.*                - TransversalEngine operations
-//! └── traversal.next_atom    - Finding the next atom to process
-//!
-//! operation.*                - Operation trait methods
-//! └── operation.*            - Individual operation implementations
-//!
-//! map.*                      - WeightedMap operations
-//! ```
-//!
-//! ## Log Levels
-//!
-//! The crate follows these conventions for log levels:
-//!
-//! - **ERROR**: Critical failures that prevent operation continuation
-//! - **WARN**: Recoverable issues or deprecated patterns
-//! - **INFO**: Major milestones and state changes
-//! - **DEBUG**: Function entry/exit, important operations, state transitions
-//! - **TRACE**: Detailed operation steps, value inspections, minor decisions
-//!
-//! ## Example with Filtering
-//!
-//! ```ignore
-//! use tracing_subscriber::fmt;
-//! use tracing_subscriber::filter::EnvFilter;
-//!
-//! fn main() {
-//!     // Show only sweep operations at debug level, operation details at trace level
-//!     let filter = EnvFilter::try_from_default_env()
-//!         .unwrap_or_else(|_| EnvFilter::new("sweep=debug,operation=trace"));
-//!
-//!     fmt()
-//!         .with_env_filter(filter)
-//!         .init();
-//! }
-//! ```
-//!
 //! ## Creating Custom Operations
 //!
 //! Operations implement the [`TransformOp`] trait:
@@ -132,13 +82,13 @@
 //! ```ignore
 //! use tracing::{instrument, debug};
 //! use pathmap::zipper::WriteZipperTracked;
-//! use weighted_atom_sweep::{TransformOp, AtomHeader};
+//! use weighted_atom_sweep::TransformOp;
 //!
 //! struct MyCustomOp;
 //!
-//! impl<H: AtomHeader> TransformOp<H> for MyCustomOp {
+//! impl TransformOp for MyCustomOp {
 //!     fn name(&self) -> &str { "my_custom_operation" }
-//!     fn apply(&self, wz: &mut WriteZipperTracked<H>, _atom_path: &[u8]) {
+//!     fn apply(&self, wz: &mut WriteZipperTracked<u64>, _atom_path: &[u8]) {
 //!         debug!("starting custom transformation");
 //!         // Navigate and modify the subtrie via wz
 //!         debug!("transformation completed");
@@ -149,22 +99,26 @@
 //! Or use the simple function pointer form:
 //!
 //! ```ignore
-//! use weighted_atom_sweep::{Operation, AtomHeader};
+//! use weighted_atom_sweep::Operation;
 //! use pathmap::zipper::WriteZipperTracked;
 //!
-//! fn my_transform(wz: &mut WriteZipperTracked<MyHeader>, _atom_path: &[u8]) {
+//! fn my_transform(wz: &mut WriteZipperTracked<u64>, _atom_path: &[u8]) {
 //!     // ... transformation logic ...
 //! }
 //!
 //! let op = Operation::new("my_operation", my_transform);
 //! ```
 
+pub mod new_eng_op;
+pub mod random_walk;
+pub mod cpq;
 mod map;
 mod operation;
 pub mod sexpr_operation;
 mod sweep;
-mod traversal;
+pub mod traversal;
 
+pub use new_eng_op::{build_operation, build_strategy};
 pub use operation::{Operation, OperationObserver, TransformOp};
 pub use sexpr_operation::{SExprOperation, TemplateEffect};
 pub use sweep::WeightedAtomSweep;

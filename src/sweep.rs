@@ -1,43 +1,34 @@
 use crate::map::WeightedMap;
 use crate::operation::{OperationObserver, TransformOp};
 use crate::traversal::TraversalEngine;
+use crate::new_eng_op::build_strategy;
 use pathmap::zipper::{ZipperCreation, ZipperHeadOwned, ZipperMoving};
 use pathmap::PathMap;
+use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc, Arc, RwLock,
 };
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use tracing::{debug, instrument, span, trace, Level};
 
+/// The path of an atom in the trie, represented as a byte vector.
 pub type AtomPosition = Vec<u8>;
 
-pub trait AtomHeader: std::fmt::Debug + Clone + Send + Sync + Unpin + 'static {}
-
+/// Settings for the weighted atom sweep.
 #[derive(Default)]
 pub struct WeightedAtomSweepSettings {}
 
-/// Represents a single traversal engine with its subscribed operations.
-///
-/// Each process spawns 2 threads when the sweep is started:
-/// - A traversal thread that continuously samples atoms using the engine
-/// - An operations thread that acquires write zippers at sampled positions
-///   and applies subscribed operations to the focused subtrie
-pub struct SweepProcess<H>
-where
-    H: AtomHeader,
-{
-    engine: TraversalEngine<H>,
-    operations: Vec<Box<dyn TransformOp<H>>>,
+/// A single traversal process: an engine paired with a set of operations.
+pub struct SweepProcess {
+    pub engine: Box<dyn TraversalEngine>,
+    pub operations: Vec<Box<dyn TransformOp>>,
 }
 
-impl<H> SweepProcess<H>
-where
-    H: AtomHeader,
-{
-    /// Create a new traversal process with the given engine and no operations.
-    pub fn new(engine: TraversalEngine<H>) -> Self {
-        debug!("creating new TraversalProcess");
+impl SweepProcess {
+    /// Create a new process with the given traversal engine.
+    pub fn new(engine: Box<dyn TraversalEngine>) -> Self {
         Self {
             engine,
             operations: Vec::new(),
@@ -50,411 +41,605 @@ where
     }
 }
 
-impl<H> OperationObserver<H> for SweepProcess<H>
-where
-    H: AtomHeader,
-{
+impl OperationObserver for SweepProcess {
     #[instrument(skip_all, name = "process.subscribe")]
-    fn subscribe(&mut self, operation: impl TransformOp<H> + 'static) {
+    fn subscribe(&mut self, operation: Box<dyn TransformOp>) {
         let name = operation.name().to_string();
         let total_operations = self.operations.len() + 1;
         debug!(
             operation_name = %name,
             total_operations, "subscribing operation to process"
         );
-        self.operations.push(Box::new(operation));
-        trace!("operation subscribed successfully");
+        self.operations.push(operation);
     }
 
     #[instrument(skip_all, name = "process.unsubscribe_by_name")]
     fn unsubscribe_by_name(&mut self, name: &str) {
-        let initial_count = self.operations.len();
+        let total_operations = self.operations.len() - 1;
         debug!(
-            operation_name = name,
-            initial_count, "unsubscribing operation from process"
+            operation_name = %name,
+            total_operations, "unsubscribing operation from process"
         );
         self.operations.retain(|op| op.name() != name);
-        let final_count = self.operations.len();
-        let removed = initial_count - final_count;
-        debug!(removed, final_count, "operation unsubscribe complete");
     }
 }
 
-pub struct SweepController<H: AtomHeader> {
-    pub map: Arc<ZipperHeadOwned<H>>,
+/// Controls the background WeightedAtomSweep.
+///
+/// ### Channel Preservation
+/// The internal mpsc channels and operations buffer are fully preserved and survive
+/// pause/resume cycles. Atoms queued during traversal remain in the queue and are
+/// processed immediately when the sweep is resumed, guaranteeing zero atom loss.
+pub struct SweepController {
+    /// The shared container holding the active trie map.
+    /// Threads clone the Arc briefly on each iteration, releasing it immediately
+    /// to minimize lock contention and allow the trie to be reclaimed.
+    pub map: Arc<RwLock<Option<Arc<ZipperHeadOwned<u64>>>>>,
     handles: Vec<JoinHandle<()>>,
     shutdown_signal: Arc<AtomicBool>,
+    paused_signal: Arc<AtomicBool>,
+    parked_count: Arc<AtomicUsize>,
 }
 
-impl<H: AtomHeader> SweepController<H> {
-    /// Wait for sweep to complete naturally (when threads finish)
+impl SweepController {
+    /// Check if the controller is active and running (not paused and threads are alive).
+    pub fn is_available(&self) -> bool {
+        !self.paused_signal.load(Ordering::Acquire) && !self.shutdown_signal.load(Ordering::Acquire)
+    }
+
+    /// Check if the controller is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused_signal.load(Ordering::Acquire)
+    }
+
+    /// Retrieve the current count of parked threads.
+    pub fn parked_count(&self) -> usize {
+        self.parked_count.load(Ordering::Acquire)
+    }
+
+    /// Retrieve the total number of managed threads.
+    pub fn thread_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Wait for sweep to complete naturally.
     pub fn wait(mut self) -> Result<(), Box<dyn std::error::Error>> {
         debug!("waiting for sweep completion");
-
         for handle in self.handles.drain(..) {
             handle.join().map_err(|_| "thread panicked")?;
         }
-
         debug!("sweep completed");
         Ok(())
     }
 
-    /// Signal threads to shutdown and wait for them to terminate
+    /// Signal threads to shutdown and wait for them to terminate.
     pub fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error>> {
         debug!("initiating sweep shutdown");
         self.shutdown_signal.store(true, Ordering::SeqCst);
+        self.paused_signal.store(false, Ordering::SeqCst); // Unpark any parked threads
 
         for handle in self.handles.drain(..) {
-            handle
-                .join()
-                .map_err(|_| "thread panicked during shutdown")?;
+            handle.join().map_err(|_| "thread panicked during shutdown")?;
+        }
+
+        // Clear the map holder to release the trie
+        if let Ok(mut guard) = self.map.write() {
+            *guard = None;
         }
 
         debug!("sweep shutdown complete");
         Ok(())
     }
 
-    /// Get a reference to the map for external access
-    pub fn map_ref(&self) -> &Arc<ZipperHeadOwned<H>> {
-        &self.map
+    /// Pause all background threads, wait for them to park, and reclaim exclusive ownership
+    /// of the trie, returning it as a PathMap for foreground access.
+    pub fn pause(&self) -> PathMap<u64> {
+        debug!("starting sweep pause sequence");
+
+        let total_threads = self.handles.len();
+        if total_threads == 0 {
+            panic!("no threads are currently active in this sweep");
+        }
+
+        if self.paused_signal.load(Ordering::Acquire) {
+            panic!("sweep is already paused");
+        }
+
+        self.paused_signal.store(true, Ordering::SeqCst);
+
+        let pause_deadline = Instant::now() + Duration::from_secs(30);
+        while self.parked_count.load(Ordering::SeqCst) < total_threads {
+            if self.shutdown_signal.load(Ordering::Acquire) {
+                break;
+            }
+            if Instant::now() > pause_deadline {
+                panic!(
+                    "pause() timed out after 30s waiting for {}/{} threads to park",
+                    self.parked_count.load(Ordering::SeqCst),
+                    total_threads
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        debug!("all sweep threads parked and quiescent");
+
+        let map_arc = {
+            let mut guard = self.map.write().expect("failed to acquire write lock");
+            guard.take().expect("map was already leased or is missing")
+        };
+
+        debug_assert_eq!(
+            Arc::strong_count(&map_arc),
+            1,
+            "Invariant violated: Arc strong count must be exactly 1 when threads are parked"
+        );
+
+        let zipper_head = Arc::try_unwrap(map_arc)
+            .expect("failed to reclaim leased trie: references still held");
+
+        let path_map = zipper_head.into_map();
+
+        debug!("sweep pause sequence completed successfully");
+        path_map
     }
 
-    /// Get the number of threads managed by this controller.
-    /// This will be 2*N where N is the number of processes.
-    pub fn thread_count(&self) -> usize {
-        self.handles.len()
-    }
+    /// Return an updated trie back to the background sweep and resume thread execution.
+    pub fn resume(&self, new_map: PathMap<u64>) {
+        debug!("starting sweep resume sequence");
 
-    /// Get the number of processes (thread pairs) in this sweep.
-    pub fn process_count(&self) -> usize {
-        self.handles.len() / 2
+        if new_map.val_count() == 0 {
+            debug!("warning: incoming PathMap for resume is empty");
+        }
+
+        let head = Arc::new(new_map.into_zipper_head([]));
+
+        {
+            let mut guard = self.map.write().expect("failed to acquire write lock");
+            *guard = Some(head);
+        }
+
+        self.paused_signal.store(false, Ordering::SeqCst);
+
+        debug!("sweep resume sequence completed successfully");
     }
 }
 
-#[allow(dead_code)]
-pub struct WeightedAtomSweep<H>
-where
-    H: AtomHeader,
-{
-    processes: Vec<SweepProcess<H>>,
-    settings: WeightedAtomSweepSettings,
-    pub map: WeightedMap<H>,
+impl Drop for SweepController {
+    fn drop(&mut self) {
+        debug!("dropping SweepController, performing resource cleanup");
+
+        self.shutdown_signal.store(true, Ordering::SeqCst);
+        self.paused_signal.store(false, Ordering::SeqCst);
+
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+
+        if let Ok(mut guard) = self.map.write() {
+            *guard = None;
+        }
+
+        debug!("SweepController dropped cleanly");
+    }
 }
 
-impl<H> WeightedAtomSweep<H>
-where
-    H: AtomHeader,
-{
+/// Long-lived registry for sweep processes and controllers.
+///
+/// Manages multiple [`SweepProcess`] instances and their spawned [`SweepController`]s.
+/// Supports pause/resume/shutdown lifecycle for all controllers.
+pub struct WeightedAtomSweep {
+    pub processes: HashMap<String, SweepProcess>,
+    pub settings: WeightedAtomSweepSettings,
+    pub map: Option<WeightedMap>,
+    pub controllers: HashMap<String, SweepController>,
+    next_id: usize,
+}
+
+impl WeightedAtomSweep {
     #[instrument(skip_all, name = "sweep.new")]
     pub fn new(settings: WeightedAtomSweepSettings) -> Self {
         debug!("initializing WeightedAtomSweep");
         trace!("creating new PathMap and initializing WeightedMap");
 
         let result = Self {
-            processes: Vec::new(),
+            processes: HashMap::new(),
             settings,
-            map: WeightedMap {
-                inner: Arc::new(PathMap::<H>::new().into_zipper_head([])),
-            },
+            map: Some(WeightedMap {
+                inner: Arc::new(PathMap::<u64>::new().into_zipper_head([])),
+            }),
+            controllers: HashMap::new(),
+            next_id: 0,
         };
 
         debug!("WeightedAtomSweep initialization complete");
         result
     }
 
-    /// Add a traversal engine to the sweep and return a mutable reference
-    /// to configure it (subscribe operations).
-    ///
-    /// # Example
-    /// ```ignore
-    /// let mut sweep = WeightedAtomSweep::new(settings);
-    /// let process = sweep.add_engine(importance_engine);
-    /// process.subscribe(my_operation);
-    /// ```
+    /// Add a traversal engine by strategy key, returning a mutable reference
+    /// to the new process for operation subscription.
     #[instrument(skip_all, name = "sweep.add_engine")]
-    pub fn add_engine(&mut self, engine: TraversalEngine<H>) -> &mut SweepProcess<H> {
+    pub fn add_engine(&mut self, name: &str, strategy_key: &str) -> &mut SweepProcess {
         debug!("adding new traversal engine to sweep");
+        let engine = build_strategy(strategy_key)
+            .unwrap_or_else(|| panic!("unknown traversal strategy '{strategy_key}'"));
+
         let process = SweepProcess::new(engine);
-        self.processes.push(process);
+        self.processes.insert(name.to_string(), process);
+
         let process_count = self.processes.len();
         debug!(process_count, "engine added successfully");
-        self.processes.last_mut().unwrap()
+
+        self.processes.get_mut(name).unwrap()
     }
 
-    /// Get the number of processes (engines) in this sweep.
+    /// Get the number of registered processes.
     pub fn process_count(&self) -> usize {
         self.processes.len()
     }
 
+    /// Get a mutable reference to a registered process by name.
+    pub fn get_process_mut(&mut self, name: &str) -> Option<&mut SweepProcess> {
+        self.processes.get_mut(name)
+    }
+
+    /// Spawn all registered processes into background threads.
+    ///
+    /// Takes the pending processes (draining them), creates a shared
+    /// `Arc<RwLock<Option<Arc<ZipperHeadOwned>>>>` for all spawned controllers,
+    /// and returns a unique handle name.
+    ///
+    /// The caller must ensure `self.map.is_some()` before calling spawn.
+    /// Space is responsible for setting `was.map` during the A→B transition.
     #[instrument(skip_all, name = "sweep.spawn")]
-    pub fn spawn(self) -> SweepController<H> {
-        let process_count = self.processes.len();
+    pub fn spawn(&mut self) -> String {
+        let processes = std::mem::take(&mut self.processes);
+        let process_count = processes.len();
         debug!(process_count, "spawning WeightedAtomSweep threads");
 
         if process_count == 0 {
             debug!("warning: no processes added, sweep will do nothing");
         }
 
-        let map = self.map.inner.clone();
+        let map_arc = self.map.as_ref()
+            .expect("map must be set before spawn() — call Space to enter STATE B")
+            .inner
+            .clone();
+
+        let map_lock = Arc::new(RwLock::new(Some(map_arc)));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let parked_count = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
 
-        // Spawn thread pairs for each process
-        for (process_idx, process) in self.processes.into_iter().enumerate() {
-            let engine = process.engine.clone();
+        for (name, process) in processes.into_iter() {
+            let engine = process.engine;
             let operations = process.operations;
-            let operation_count = operations.len();
 
-            // Clone shared resources for this process
-            let map_for_traversal = self.map.inner.clone();
-            let map_for_operations = self.map.inner.clone();
+            let map_lock_t = map_lock.clone();
+            let map_lock_o = map_lock.clone();
             let shutdown_traversal = shutdown.clone();
             let shutdown_operations = shutdown.clone();
             let pause_flag = Arc::new(AtomicBool::new(false));
             let pause_for_traversal = pause_flag.clone();
             let pause_for_operations = pause_flag.clone();
 
-            // Create channel for this process
+            let paused_t = paused.clone();
+            let paused_o = paused.clone();
+            let parked_t = parked_count.clone();
+            let parked_o = parked_count.clone();
+
             let (atom_sender, atom_receiver) = mpsc::channel::<AtomPosition>();
 
-            // Spawn traversal thread for this process
-            //
-            // The traversal thread creates a ReadZipperTracked at root, uses the
-            // engine to sample an atom, then DROPS the read zipper before sending
-            // the AtomPosition through the channel. This ensures no read zipper is
-            // held while the operations thread acquires a write zipper, avoiding
-            // zipper conflicts.
+            let name_t = name.clone();
+            let name_o = name.clone();
+
             let traversal_handle = std::thread::spawn(move || {
-                let traversal_span = span!(Level::DEBUG, "traversal_thread", process_idx);
-                let _enter = traversal_span.enter();
-
-                debug!(
-                    process_idx,
-                    "traversal thread started - entering sampling loop"
-                );
-
+                let _span = span!(Level::DEBUG, "traversal_thread", engine = %name_t).entered();
+                debug!("traversal thread started - entering sampling loop");
                 loop {
-                    // Check for shutdown signal
-                    if shutdown_traversal.load(Ordering::Relaxed) {
-                        debug!(
-                            process_idx,
-                            "shutdown signal received, exiting traversal loop"
-                        );
-                        break;
-                    }
-
-                    // Check pause flag - if operations has a conflict, wait before sampling
-                    while pause_for_traversal.load(Ordering::Relaxed) {
-                        if shutdown_traversal.load(Ordering::Relaxed) {
-                            break;
+                    if paused_t.load(Ordering::Acquire) {
+                        parked_t.fetch_add(1, Ordering::SeqCst);
+                        while paused_t.load(Ordering::Acquire) {
+                            if shutdown_traversal.load(Ordering::Acquire) { break; }
+                            std::thread::sleep(Duration::from_millis(10));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        parked_t.fetch_sub(1, Ordering::SeqCst);
                     }
 
-                    // Check shutdown again after pause
-                    if shutdown_traversal.load(Ordering::Relaxed) {
+                    if shutdown_traversal.load(Ordering::Acquire) {
+                        debug!("shutdown signal received, exiting traversal loop");
                         break;
                     }
 
-                    // Get access to a read zipper at root for sampling.
-                    // The read zipper is created and consumed within this match block,
-                    // ensuring it is dropped before atom_sender.send() is called.
-                    match (*map_for_traversal).read_zipper_at_borrowed_path(&[]) {
-                        Ok(traverse_zp) => {
-                            trace!(process_idx, "acquired read zipper for sampling");
-                            match (engine.next_atom)(traverse_zp) {
-                                Ok(atom_path) => {
-                                    debug!(
-                                        process_idx,
-                                        atom_path_len = atom_path.len(),
-                                        "atom sampled via traversal"
-                                    );
-                                    if atom_sender.send(atom_path).is_err() {
-                                        debug!(
-                                            process_idx,
-                                            "operations thread terminated - stopping traversal"
-                                        );
-                                        break;
+                    while pause_for_traversal.load(Ordering::Acquire) {
+                        if paused_t.load(Ordering::Acquire) { break; }
+                        if shutdown_traversal.load(Ordering::Acquire) { break; }
+                        std::thread::yield_now();
+                    }
+
+                    if shutdown_traversal.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let mut sampled = false;
+                    {
+                        let local_map_opt = {
+                            if let Ok(guard) = map_lock_t.read() {
+                                guard.clone()
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(map_arc) = local_map_opt {
+                            if let Ok(traverse_zp) = (*map_arc).read_zipper_at_borrowed_path(&[]) {
+                                match engine.next_atom(traverse_zp) {
+                                    Ok(atom_path) => {
+                                        if atom_sender.send(atom_path).is_ok() {
+                                            sampled = true;
+                                        } else {
+                                            break;
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    // Log and continue (resilient mode)
-                                    trace!(process_idx, "error during atom traversal: {:?}", e);
+                                    Err(_) => {}
                                 }
                             }
                         }
-                        Err(e) => {
-                            trace!(process_idx, "failed to acquire read zipper: {:?}", e);
-                        }
+                    }
+
+                    if !sampled {
+                        std::thread::yield_now();
                     }
                 }
-
-                debug!(process_idx, "traversal thread completed");
-                drop(atom_sender); // Signal operations thread
+                debug!("traversal thread completed");
             });
 
             handles.push(traversal_handle);
 
-            // Spawn operations thread for this process
-            //
-            // For each received AtomPosition, the operations thread acquires a
-            // WriteZipperTracked focused at that path via write_zipper_at_exclusive_path.
-            // This write zipper is scoped: the operation can navigate and modify the
-            // subtrie at and below the focus, but cannot ascend above it.
-            //
-            // After all operations complete, the write zipper is cleaned up via
-            // cleanup_write_zipper to prune any dangling paths created by the
-            // exclusive path mechanism.
             let operations_handle = std::thread::spawn(move || {
-                let operations_span = span!(
-                    Level::DEBUG,
-                    "operations_thread",
-                    process_idx,
-                    operation_count
-                );
-                let _enter = operations_span.enter();
-
-                debug!(
-                    process_idx,
-                    operation_count, "operations thread started - entering processing loop"
-                );
-
+                let _span = span!(Level::DEBUG, "operations_thread", engine = %name_o).entered();
                 let mut buffer: Vec<AtomPosition> = Vec::new();
 
                 loop {
-                    // Try to receive new atom from traversal (non-blocking)
+                    if paused_o.load(Ordering::Acquire) {
+                        parked_o.fetch_add(1, Ordering::SeqCst);
+                        while paused_o.load(Ordering::Acquire) {
+                            if shutdown_operations.load(Ordering::Acquire) { break; }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        parked_o.fetch_sub(1, Ordering::SeqCst);
+                    }
+
+                    if shutdown_operations.load(Ordering::Acquire) {
+                        debug!("operations thread: shutdown detected, exiting");
+                        break;
+                    }
+
                     if let Ok(atom_path) = atom_receiver.try_recv() {
-                        debug!(
-                            process_idx,
-                            atom_path_len = atom_path.len(),
-                            operation_count,
-                            "received atom from traversal, pushing to buffer"
-                        );
                         buffer.push(atom_path);
                     }
 
-                    // Process buffer in FIFO order
                     let mut made_progress = false;
-                    let mut i = 0;
-                    while i < buffer.len() {
-                        let atom_path = &buffer[i];
-
-                        debug!(
-                            process_idx,
-                            atom_path_len = atom_path.len(),
-                            operation_count,
-                            "processing atom from buffer"
-                        );
-
-                        // Acquire a write zipper at the atom's position.
-                        // This gives exclusive write access to the subtrie at
-                        // and below atom_path. The zipper's root IS atom_path,
-                        // so ascend() returns false at this boundary.
-                        match map_for_operations.write_zipper_at_exclusive_path(&atom_path[..]) {
-                            Ok(mut wz) => {
-                                for (idx, op) in operations.iter().enumerate() {
-                                    let op_span = span!(
-                                        Level::TRACE,
-                                        "operation",
-                                        process_idx,
-                                        operation_idx = idx,
-                                        name = op.name()
-                                    );
-                                    let _op_enter = op_span.enter();
-
-                                    trace!(process_idx, "executing operation");
-
-                                    // Catch panics to prevent thread death
-                                    let result = std::panic::catch_unwind(
-                                        std::panic::AssertUnwindSafe(|| {
-                                            op.apply(&mut wz, atom_path);
-                                        }),
-                                    );
-
-                                    if let Err(e) = result {
-                                        trace!(process_idx, "operation panicked: {:?}", e);
-                                    } else {
-                                        trace!(process_idx, "operation completed");
-                                    }
-
-                                    // Reset the write zipper to the focus root
-                                    // between operations so each starts at the
-                                    // same position
-                                    wz.reset();
-                                }
-
-                                // Cleanup the write zipper: drops it and prunes
-                                // any dangling path nodes created by the exclusive
-                                // path mechanism
-                                map_for_operations.cleanup_write_zipper(wz);
-
-                                debug!(process_idx, "all operations completed for atom");
-                                buffer.remove(i);
-                                made_progress = true;
+                    if !buffer.is_empty() {
+                        let local_map_opt = {
+                            if let Ok(guard) = map_lock_o.read() {
+                                guard.clone()
+                            } else {
+                                None
                             }
-                            Err(conflict) => {
-                                // Another process may hold a conflicting zipper.
-                                // Set pause flag to slow down traversal, keep in buffer.
-                                trace!(
-                                    process_idx,
-                                    "write zipper conflict for atom, pausing traversal: {:?}",
-                                    conflict
-                                );
-                                pause_for_operations.store(true, Ordering::Relaxed);
-                                i += 1;
+                        };
+
+                        if let Some(map_arc) = local_map_opt {
+                            let mut i = 0;
+                            while i < buffer.len() {
+                                let atom_path = &buffer[i];
+                                let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    map_arc.write_zipper_at_exclusive_path(&atom_path[..])
+                                }));
+                                let wz_result: Result<_, _> = match write_result {
+                                    Ok(Ok(wz)) => Ok(wz),
+                                    Ok(Err(e)) => Err(e),
+                                    Err(panic_payload) => {
+                                        let msg = panic_payload.downcast_ref::<&str>().unwrap_or(&"unknown");
+                                        debug!(
+                                            "operations thread: write_zipper panicked ({}), skipping atom",
+                                            msg
+                                        );
+                                        pause_for_operations.store(true, Ordering::Release);
+                                        i += 1;
+                                        continue;
+                                    }
+                                };
+                                match wz_result {
+                                    Ok(mut wz) => {
+                                        for op in operations.iter() {
+                                            let _result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                op.apply(&mut wz, atom_path);
+                                            }));
+                                            wz.reset();
+                                        }
+                                        map_arc.cleanup_write_zipper(wz);
+                                        buffer.remove(i);
+                                        made_progress = true;
+                                    }
+                                    Err(_) => {
+                                        pause_for_operations.store(true, Ordering::Release);
+                                        i += 1;
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // Clear pause flag only if buffer is empty
                     if buffer.is_empty() {
-                        pause_for_operations.store(false, Ordering::Relaxed);
+                        pause_for_operations.store(false, Ordering::Release);
                     }
 
-                    // If we couldn't make progress (all conflicts), sleep before retry
                     if !made_progress && !buffer.is_empty() {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        std::thread::yield_now();
                     }
 
-                    // Check if traversal has ended and buffer is empty
                     if buffer.is_empty() {
-                        // Use try_recv to check if channel is disconnected
                         match atom_receiver.try_recv() {
                             Ok(atom_path) => {
                                 buffer.push(atom_path);
                             }
                             Err(mpsc::TryRecvError::Disconnected) => {
-                                debug!(
-                                    process_idx,
-                                    "traversal complete - channel closed, buffer empty, exiting"
-                                );
                                 break;
                             }
                             Err(mpsc::TryRecvError::Empty) => {
-                                // Channel still open but no new messages, continue
+                                std::thread::sleep(Duration::from_millis(5));
                             }
                         }
                     }
                 }
-
-                debug!(process_idx, "operations thread completed");
-                shutdown_operations.store(true, Ordering::Relaxed);
+                debug!("operations thread completed");
+                shutdown_operations.store(true, Ordering::Release);
             });
-
             handles.push(operations_handle);
 
-            debug!(process_idx, "spawned thread pair for process");
+            debug!(engine = %name, "spawned thread pair for process");
         }
 
+        let name = format!("sweep-{}", self.next_id);
+        self.next_id += 1;
+        let total_threads = handles.len();
+
+        let controller = SweepController {
+            map: map_lock,
+            handles,
+            shutdown_signal: shutdown,
+            paused_signal: paused,
+            parked_count,
+        };
+
         debug!(
-            total_threads = handles.len(),
+            name = %name,
+            total_threads,
             "spawn operation complete, returning controller"
         );
 
-        SweepController {
-            map,
-            handles,
-            shutdown_signal: shutdown,
+        self.controllers.insert(name.clone(), controller);
+        name
+    }
+
+    /// Pause all controllers and reclaim the trie.
+    ///
+    /// Sets the paused signal on all controllers, waits for all threads to park,
+    /// then reclaims the trie from the shared map slot. All controllers share the
+    /// same `Arc<RwLock<Option<Arc<ZipperHeadOwned>>>>` so pausing/reclaiming once
+    /// on any controller suffices for the shared slot — but we must wait for ALL
+    /// threads (across all controllers) to park before reclaiming.
+    pub fn pause_all(&mut self) -> PathMap<u64> {
+        debug!("pausing all sweep controllers");
+
+        if self.controllers.is_empty() {
+            panic!("no controllers to pause");
         }
+
+        // Signal pause to all controllers
+        for ctrl in self.controllers.values() {
+            ctrl.paused_signal.store(true, Ordering::SeqCst);
+        }
+
+        // Wait for ALL threads across all controllers to park
+        let pause_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let total_parked: usize = self.controllers.values().map(|c| c.parked_count.load(Ordering::SeqCst)).sum();
+            let total_threads: usize = self.controllers.values().map(|c| c.handles.len()).sum();
+            if total_parked >= total_threads {
+                break;
+            }
+            if std::time::Instant::now() > pause_deadline {
+                panic!(
+                    "pause_all() timed out after 30s waiting for {}/{} threads to park",
+                    total_parked, total_threads
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        debug!("all sweep threads parked and quiescent");
+
+        // Reclaim the trie from the first controller's shared slot
+        // (all controllers share the same Arc<RwLock<...>>)
+        let first_ctrl = self.controllers.values().next().unwrap();
+        let map_arc = {
+            let mut guard = first_ctrl.map.write().expect("failed to acquire write lock");
+            guard.take().expect("map was already leased or is missing")
+        };
+
+        debug_assert_eq!(
+            Arc::strong_count(&map_arc),
+            1,
+            "Invariant violated: Arc strong count must be exactly 1 when threads are parked"
+        );
+
+        let zipper_head = Arc::try_unwrap(map_arc)
+            .expect("failed to reclaim leased trie: references still held");
+
+        let path_map = zipper_head.into_map();
+        self.map = None;
+
+        debug!("sweep pause_all completed successfully");
+        path_map
+    }
+
+    /// Resume all controllers with an updated trie.
+    pub fn resume_all(&mut self, map: PathMap<u64>) {
+        debug!("resuming all sweep controllers");
+        let head = Arc::new(map.into_zipper_head([]));
+        let weighted = WeightedMap { inner: head.clone() };
+        self.map = Some(weighted);
+        for ctrl in self.controllers.values() {
+            // Put the head into the shared slot
+            if let Ok(mut guard) = ctrl.map.write() {
+                *guard = Some(head.clone());
+            }
+        }
+        // Clear paused signal for all
+        for ctrl in self.controllers.values() {
+            ctrl.paused_signal.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Shutdown all controllers and reclaim the trie.
+    pub fn shutdown_all(&mut self) -> Option<PathMap<u64>> {
+        debug!("shutting down all sweep controllers");
+        let names: Vec<String> = self.controllers.keys().cloned().collect();
+        let mut result = None;
+        for name in names {
+            if let Some(map) = self.shutdown(&name) {
+                result = Some(map);
+            }
+        }
+        result
+    }
+
+    /// Shutdown a specific controller by name and reclaim its trie.
+    pub fn shutdown(&mut self, name: &str) -> Option<PathMap<u64>> {
+        if let Some(ctrl) = self.controllers.remove(name) {
+            debug!(name, "shutting down sweep controller");
+            // Take ownership and shutdown — Drop will clean up threads
+            // Then try to reclaim the trie from the shared slot
+            if self.controllers.is_empty() {
+                // Last controller — reclaim the trie
+                if let Ok(mut guard) = ctrl.map.write() {
+                    if let Some(arc) = guard.take() {
+                        if let Ok(head) = Arc::try_unwrap(arc) {
+                            let map = head.into_map();
+                            self.map = Some(WeightedMap {
+                                inner: Arc::new(PathMap::<u64>::new().into_zipper_head([])),
+                            });
+                            return Some(map);
+                        }
+                    }
+                }
+            }
+            // Force shutdown
+            drop(ctrl);
+        }
+        None
     }
 }

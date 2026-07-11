@@ -1,49 +1,41 @@
-use crate::sweep::AtomHeader;
-use pathmap::zipper::{Zipper, ZipperCreation, ZipperHeadOwned, ZipperValues, ZipperWriting};
+use pathmap::zipper::{ZipperCreation, ZipperHeadOwned, ZipperValues, ZipperWriting};
 use std::{ops::Deref, sync::Arc};
 
 /// A thread-safe wrapper around PathMap's ZipperHeadOwned for managing weighted atoms.
 ///
-/// # Tracing
-/// This struct serves as a container for the atom map used throughout the sweep process.
-/// Operations using this map should emit traces at the following levels:
-/// - DEBUG: For significant structural operations (initialization, major updates)
-/// - TRACE: For detailed navigation and zipper operations (path lookups, position changes)
-///
-/// The actual tracing is handled by code using WeightedMap, particularly in the
-/// WeightedAtomSweep module where zippers are accessed and atoms are processed.
-pub struct WeightedMap<H: AtomHeader> {
-    pub inner: Arc<ZipperHeadOwned<H>>,
+/// Uses `u64` as the value type for weight tracking. Each atom's weight is
+/// stored as the trie value at its path. The `agg_w` field on trie nodes
+/// (from PathMap's Stage A) keeps aggregate weights up to date.
+pub struct WeightedMap {
+    pub inner: Arc<ZipperHeadOwned<u64>>,
 }
 
-impl<H> Deref for WeightedMap<H>
-where
-    H: AtomHeader,
-{
-    type Target = ZipperHeadOwned<H>;
+impl Deref for WeightedMap {
+    type Target = ZipperHeadOwned<u64>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl<H> WeightedMap<H>
-where
-    H: AtomHeader,
-{
-    pub fn get_val(&self, path: &[u8]) -> Option<H> {
+impl WeightedMap {
+    /// Read the weight stored at `path`.
+    pub fn get_val(&self, path: &[u8]) -> Option<u64> {
         match self.inner.read_zipper_at_path(path) {
             Ok(z) => z.val().cloned(),
             Err(_) => None,
         }
     }
 
-    pub fn set_weighted_val(&self, path: &[u8], val: H) -> Result<(), ()> {
+    /// Set the weight at `path`. Uses `set_val` (not `set_val_w`) because
+    /// this is a direct map operation — no agg_w propagation is needed
+    /// at this level.
+    pub fn set_weighted_val(&self, path: &[u8], val: u64) -> Result<(), ()> {
         if let Ok(mut z) = self.inner.write_zipper_at_exclusive_path(path) {
             z.set_val(val);
             Ok(())
         } else {
-             Err(())
+            Err(())
         }
     }
 }

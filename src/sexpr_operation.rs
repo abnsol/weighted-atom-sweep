@@ -1,4 +1,3 @@
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -7,12 +6,11 @@ use pathmap::zipper::{WriteZipperTracked, Zipper, ZipperMoving, ZipperWriting};
 use tracing::{debug, trace, warn};
 
 use crate::operation::TransformOp;
-use crate::sweep::AtomHeader;
 
 /// The effect applied to a template after variable substitution.
 #[derive(Clone, Debug)]
 pub enum TemplateEffect {
-    /// Insert the instantiated template as a trie path, setting `H::default()`
+    /// Insert the instantiated template as a trie path, setting a default value
     /// at the leaf.
     Add,
 
@@ -51,23 +49,19 @@ pub enum TemplateEffect {
 /// # Example
 /// ```ignore
 /// use mork_expr::parse;
-/// use weighted_atom_sweep::{SExprOperation, TemplateEffect, AtomHeader};
-///
-/// #[derive(Debug, Clone, Default)]
-/// struct H;
-/// impl AtomHeader for H {}
+/// use weighted_atom_sweep::{SExprOperation, TemplateEffect};
 ///
 /// let pattern = parse!("[3] = $ _1");
 /// let template = parse!("[2] matched $");
 ///
 /// // Match (= $x $x) in the subtrie, and for each match add (matched $x)
-/// let op = SExprOperation::<H>::exec(
+/// let op = SExprOperation::exec(
 ///     "match_and_add",
 ///     &pattern,
 ///     &[(&template[..], TemplateEffect::Add)],
 /// );
 /// ```
-pub struct SExprOperation<H: AtomHeader> {
+pub struct SExprOperation {
     name: String,
     /// The mm2-encoded pattern expression. May contain `NewVar`/`VarRef`.
     /// An empty pattern means "match unconditionally" — templates are applied
@@ -78,10 +72,9 @@ pub struct SExprOperation<H: AtomHeader> {
     /// Cumulative match counter. Incremented for each successful pattern match.
     /// Observable via [`Self::match_count()`].
     match_counter: Arc<AtomicUsize>,
-    _phantom: PhantomData<H>,
 }
 
-impl<H: AtomHeader> SExprOperation<H> {
+impl SExprOperation {
     /// Create an exec operation.
     ///
     /// # Arguments
@@ -112,7 +105,7 @@ impl<H: AtomHeader> SExprOperation<H> {
                 .map(|(t, e)| (t.to_vec(), e.clone()))
                 .collect(),
             match_counter: Arc::new(AtomicUsize::new(0)),
-            _phantom: PhantomData,
+
         }
     }
 
@@ -147,10 +140,7 @@ impl<H: AtomHeader> SExprOperation<H> {
     ///
     /// Uses mork-expr's `extract_data` to extract variable bindings from
     /// the matched data, then `substitute` to instantiate each template.
-    fn apply_templates(&self, wz: &mut WriteZipperTracked<H>, matched_data: &[u8])
-    where
-        H: Default,
-    {
+    fn apply_templates(&self, wz: &mut WriteZipperTracked<u64>, matched_data: &[u8]) {
         if self.templates.is_empty() {
             return;
         }
@@ -217,7 +207,7 @@ impl<H: AtomHeader> SExprOperation<H> {
             match effect {
                 TemplateEffect::Add => {
                     wz.descend_to(result_bytes);
-                    wz.set_val(H::default());
+                    wz.set_val(1u64);
                     wz.reset();
                 }
                 TemplateEffect::Remove => {
@@ -233,10 +223,7 @@ impl<H: AtomHeader> SExprOperation<H> {
 
     /// Apply templates unconditionally (no pattern matching, no variable
     /// substitution). Used when the pattern is empty.
-    fn apply_templates_direct(&self, wz: &mut WriteZipperTracked<H>)
-    where
-        H: Default,
-    {
+    fn apply_templates_direct(&self, wz: &mut WriteZipperTracked<u64>) {
         for (tmpl_bytes, effect) in &self.templates {
             if tmpl_bytes.is_empty() {
                 continue;
@@ -251,7 +238,7 @@ impl<H: AtomHeader> SExprOperation<H> {
             match effect {
                 TemplateEffect::Add => {
                     wz.descend_to(tmpl_bytes);
-                    wz.set_val(H::default());
+                    wz.set_val(1u64);
                     wz.reset();
                 }
                 TemplateEffect::Remove => {
@@ -281,7 +268,7 @@ impl<H: AtomHeader> SExprOperation<H> {
 
     /// Top-level: walk the pattern against the trie from the current
     /// zipper position, collecting all matched paths.
-    fn walk_pattern(&self, wz: &mut WriteZipperTracked<H>, matched_paths: &mut Vec<Vec<u8>>) {
+    fn walk_pattern(&self, wz: &mut WriteZipperTracked<u64>, matched_paths: &mut Vec<Vec<u8>>) {
         let mut references: Vec<usize> = Vec::new();
         self.walk_item(wz, 0, &mut references, matched_paths);
     }
@@ -290,7 +277,7 @@ impl<H: AtomHeader> SExprOperation<H> {
     /// the current trie position.
     fn walk_item(
         &self,
-        wz: &mut WriteZipperTracked<H>,
+        wz: &mut WriteZipperTracked<u64>,
         expr_offset: usize,
         references: &mut Vec<usize>,
         matched_paths: &mut Vec<Vec<u8>>,
@@ -405,7 +392,7 @@ impl<H: AtomHeader> SExprOperation<H> {
     /// Match `remaining` children of an arity node sequentially.
     fn walk_arity_children(
         &self,
-        wz: &mut WriteZipperTracked<H>,
+        wz: &mut WriteZipperTracked<u64>,
         expr_offset: usize,
         remaining: u8,
         references: &mut Vec<usize>,
@@ -555,7 +542,7 @@ impl<H: AtomHeader> SExprOperation<H> {
     /// with `outer_remaining` siblings starting at `siblings_offset`.
     fn walk_nested_then_siblings(
         &self,
-        wz: &mut WriteZipperTracked<H>,
+        wz: &mut WriteZipperTracked<u64>,
         expr_offset: usize,
         inner_remaining: u8,
         siblings_offset: usize,
@@ -712,7 +699,7 @@ impl<H: AtomHeader> SExprOperation<H> {
     /// each one, continue matching at `continuation_offset`.
     fn enumerate_k_paths(
         &self,
-        wz: &mut WriteZipperTracked<H>,
+        wz: &mut WriteZipperTracked<u64>,
         k: usize,
         continuation_offset: usize,
         references: &mut Vec<usize>,
@@ -737,7 +724,7 @@ impl<H: AtomHeader> SExprOperation<H> {
     /// Enumerate all k-byte paths then continue matching arity siblings.
     fn enumerate_k_paths_then_siblings(
         &self,
-        wz: &mut WriteZipperTracked<H>,
+        wz: &mut WriteZipperTracked<u64>,
         k: usize,
         siblings_offset: usize,
         remaining_siblings: u8,
@@ -777,7 +764,7 @@ impl<H: AtomHeader> SExprOperation<H> {
     /// children followed by outer siblings.
     fn enumerate_k_paths_then_nested(
         &self,
-        wz: &mut WriteZipperTracked<H>,
+        wz: &mut WriteZipperTracked<u64>,
         k: usize,
         inner_offset: usize,
         inner_remaining: u8,
@@ -853,17 +840,17 @@ fn expr_item_size(data: &[u8], offset: usize) -> usize {
     }
 }
 
-// Safety: all fields are owned (Vec<u8>, String, Arc<AtomicUsize>, PhantomData).
+// Safety: all fields are owned (Vec<u8>, String, Arc<AtomicUsize>).
 // No raw pointers are shared.
-unsafe impl<H: AtomHeader> Send for SExprOperation<H> {}
-unsafe impl<H: AtomHeader> Sync for SExprOperation<H> {}
+unsafe impl Send for SExprOperation {}
+unsafe impl Sync for SExprOperation {}
 
-impl<H: AtomHeader + Default> TransformOp<H> for SExprOperation<H> {
+impl TransformOp for SExprOperation {
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn apply(&self, wz: &mut WriteZipperTracked<H>, atom_path: &[u8]) {
+    fn apply(&self, wz: &mut WriteZipperTracked<u64>, atom_path: &[u8]) {
         trace!(
             name = %self.name,
             atom_path_len = atom_path.len(),

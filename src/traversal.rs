@@ -1,58 +1,54 @@
-use crate::sweep::{AtomHeader, AtomPosition};
+use crate::sweep::AtomPosition;
 use pathmap::zipper::ReadZipperTracked;
+use pathmap::morphisms::Catamorphism;
 use std::error::Error;
+use core::convert::Infallible;
 
+/// Error returned when traversal fails.
 #[derive(Debug)]
-pub struct TraversalError {}
+pub struct TraversalError {
+    pub message: String,
+}
+
 impl std::fmt::Display for TraversalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "traversal error")
+        write!(f, "traversal error: {}", self.message)
     }
 }
 impl Error for TraversalError {}
 
-/// Struct for traversing a structure and finding atoms.
+/// Trait for traversal engines that sample atoms from a PathMap trie.
 ///
-/// Traversal functions should emit tracing logs at the following points:
-/// - DEBUG level: When starting traversal and when atoms are found
-/// - TRACE level: For detailed traversal steps and navigation decisions
-///
-/// # Example
-/// ```ignore
-/// use tracing::{instrument, debug};
-/// use pathmap::zipper::ReadZipperTracked;
-///
-/// #[instrument(skip_all, name = "traversal.next_atom")]
-/// fn my_traversal(zipper: ReadZipperTracked<MyHeader>) -> Result<AtomPosition, TraversalError> {
-///     debug!("starting atom traversal");
-///     // ... traversal logic ...
-///     debug!(atom_path_len = atom.len(), "atom discovered");
-///     Ok(atom)
-/// }
-///
-/// let engine = TraversalEngine {
-///     name: "my_traversal",
-///     next_atom: &my_traversal,
-/// };
-/// ```
-#[derive(Clone, Copy, Debug)]
-pub struct TraversalEngine<H: AtomHeader> {
-    pub name: &'static str,
-    pub next_atom: fn(ReadZipperTracked<H>) -> Result<AtomPosition, TraversalError>,
+/// Each engine implements a strategy for selecting the next atom to process.
+/// Implementations must be `Send + Sync + 'static` so they can be moved
+/// into background sweep threads.
+pub trait TraversalEngine: Send + Sync + 'static {
+    /// Returns the name of this traversal engine, used for tracing and identification.
+    fn name(&self) -> &str;
+    /// Sample the next atom from the trie and return its path.
+    fn next_atom(&self, z: ReadZipperTracked<u64>) -> Result<AtomPosition, TraversalError>;
 }
 
-impl<H: AtomHeader> TraversalEngine<H> {
-    /// Create a new traversal engine with the given name and next_atom function.
-    pub fn new(
-        name: &'static str,
-        next_atom: fn(ReadZipperTracked<H>) -> Result<AtomPosition, TraversalError>,
-    ) -> Self {
-        Self { name, next_atom }
-    }
+/// Full catamorphism over the subtrie — O(subtree size).
+///
+/// Aggregates all values in the subtrie by summing them from leaves to root.
+/// Use as a test oracle to validate that stored `agg_w` values are correct.
+/// In production, prefer `zipper.agg_w()` which reads the O(1) stored field.
+pub fn node_agg_w<Z: Catamorphism<u64>>(path: Z) -> Result<u64, TraversalError> {
+    node_agg_w_fallible(path)
+        .map_err(|_| TraversalError {
+            message: "aggregation failed".to_string(),
+        })
 }
 
-impl<H: AtomHeader> PartialEq for TraversalEngine<H> {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
+/// Infallible variant of `node_agg_w`. Returns `Ok(u64)` always.
+/// Useful in contexts where the error type is constrained (e.g. iterator adapters).
+pub fn node_agg_w_fallible<Z: Catamorphism<u64>>(path: Z) -> Result<u64, Infallible> {
+    path.into_cata_jumping_side_effect_fallible(
+        |_mask, children: &mut [u64], _size, maybe_v: Option<&u64>, _path| {
+            let from_children = children.iter().copied().sum::<u64>();
+            let here: u64 = maybe_v.copied().unwrap_or(0);
+            Ok(here + from_children)
+        },
+    )
 }

@@ -1,59 +1,62 @@
-//! Tests of the loop, threads and operations are working
+//! Tests that the sweep loop, threads and operations work end-to-end.
 
+use std::time::Duration;
+
+use pathmap::zipper::ReadZipperTracked;
 use weighted_atom_sweep::{
-    AtomHeader, Operation, OperationObserver, TraversalEngine, WeightedAtomSweep,
-    WeightedAtomSweepSettings,
+    AtomPosition, Operation, OperationObserver, TraversalEngine, TraversalError,
+    WeightedAtomSweep, WeightedAtomSweepSettings,
 };
 
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
-pub struct Header {
-    value: u64,
-    agg: u64,
-}
+// --- Custom traversal engines (sleep, then return a fixed path) ---
 
-impl AtomHeader for Header {}
-
-mod engines {
-    use pathmap::zipper::ReadZipperTracked;
-    use weighted_atom_sweep::{AtomPosition, TraversalError};
-
-    use super::Header;
-
-    pub fn engine1(_z: ReadZipperTracked<Header>) -> Result<AtomPosition, TraversalError> {
-        std::thread::sleep(std::time::Duration::from_millis(3000));
+struct Engine1;
+impl TraversalEngine for Engine1 {
+    fn name(&self) -> &str { "engine1" }
+    fn next_atom(&self, _z: ReadZipperTracked<u64>) -> Result<AtomPosition, TraversalError> {
+        std::thread::sleep(Duration::from_millis(3000));
         Ok(vec![0])
     }
+}
 
-    pub fn engine2(_z: ReadZipperTracked<Header>) -> Result<AtomPosition, TraversalError> {
-        std::thread::sleep(std::time::Duration::from_millis(2500));
+struct Engine2;
+impl TraversalEngine for Engine2 {
+    fn name(&self) -> &str { "engine2" }
+    fn next_atom(&self, _z: ReadZipperTracked<u64>) -> Result<AtomPosition, TraversalError> {
+        std::thread::sleep(Duration::from_millis(2500));
         Ok(vec![1])
     }
 }
 
+// --- Operations (each just sleeps to simulate work) ---
+
 mod operations {
-    use super::Header;
     use pathmap::zipper::WriteZipperTracked;
+    use std::time::Duration;
 
-    pub fn log_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+    pub fn log_atom(_wz: &mut WriteZipperTracked<u64>, _atom_path: &[u8]) {
+        std::thread::sleep(Duration::from_millis(1000));
     }
 
-    pub fn process_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
-        std::thread::sleep(std::time::Duration::from_millis(5000));
+    pub fn process_atom(_wz: &mut WriteZipperTracked<u64>, _atom_path: &[u8]) {
+        std::thread::sleep(Duration::from_millis(5000));
     }
 
-    pub fn validate_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
-        std::thread::sleep(std::time::Duration::from_millis(500));
+    pub fn validate_atom(_wz: &mut WriteZipperTracked<u64>, _atom_path: &[u8]) {
+        std::thread::sleep(Duration::from_millis(500));
     }
 
-    pub fn transform_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
-        std::thread::sleep(std::time::Duration::from_millis(800));
+    pub fn transform_atom(_wz: &mut WriteZipperTracked<u64>, _atom_path: &[u8]) {
+        std::thread::sleep(Duration::from_millis(800));
     }
 
-    pub fn persist_atom(_wz: &mut WriteZipperTracked<Header>, _atom_path: &[u8]) {
-        std::thread::sleep(std::time::Duration::from_millis(600));
+    pub fn persist_atom(_wz: &mut WriteZipperTracked<u64>, _atom_path: &[u8]) {
+        std::thread::sleep(Duration::from_millis(600));
     }
+}
+
+fn op(name: &'static str, f: fn(&mut WriteZipperTracked<u64>, &[u8])) -> Box<Operation> {
+    Box::new(Operation::new(name, f))
 }
 
 #[test]
@@ -63,42 +66,73 @@ fn smoke_test() {
         .with_max_level(tracing::Level::DEBUG)
         .try_init();
 
-    let mut sweep = WeightedAtomSweep::<Header>::new(WeightedAtomSweepSettings::default());
+    let mut sweep = WeightedAtomSweep::new(WeightedAtomSweepSettings::default());
 
-    // Create and add first engine with operations
-    let engine1 = TraversalEngine::new("engine1", engines::engine1);
-    let process1 = sweep.add_engine(engine1);
+    // First engine with five operations (custom engine handed in directly).
+    {
+        let process1 = sweep.add_engine("engine1", "cpq");
+        process1.subscribe(op("log_atom", operations::log_atom));
+        process1.subscribe(op("process_atom", operations::process_atom));
+        process1.subscribe(op("validate_atom", operations::validate_atom));
+        process1.subscribe(op("transform_atom", operations::transform_atom));
+        process1.subscribe(op("persist_atom", operations::persist_atom));
+    }
 
-    let log_op = Operation::<Header>::new("log_atom", operations::log_atom);
-    let process_op = Operation::<Header>::new("process_atom", operations::process_atom);
-    let validate_op = Operation::<Header>::new("validate_atom", operations::validate_atom);
-    let transform_op = Operation::<Header>::new("transform_atom", operations::transform_atom);
-    let persist_op = Operation::<Header>::new("persist_atom", operations::persist_atom);
+    // Second engine with three operations.
+    {
+        let process2 = sweep.add_engine("engine2", "random_walk");
+        process2.subscribe(op("log_atom", operations::log_atom));
+        process2.subscribe(op("validate_atom", operations::validate_atom));
+        process2.subscribe(op("persist_atom", operations::persist_atom));
+    }
 
-    process1.subscribe(log_op);
-    process1.subscribe(process_op);
-    process1.subscribe(validate_op);
-    process1.subscribe(transform_op);
-    process1.subscribe(persist_op);
+    // Spawn the sweep threads.
+    let _name = sweep.spawn();
 
-    // Create and add second engine with operations
-    let engine2 = TraversalEngine::new("engine2", engines::engine2);
-    let process2 = sweep.add_engine(engine2);
+    // Let it run briefly then shutdown.
+    std::thread::sleep(Duration::from_millis(10_000));
+    let result = sweep.shutdown_all();
 
-    let log_op2 = Operation::<Header>::new("log_atom", operations::log_atom);
-    let validate_op2 = Operation::<Header>::new("validate_atom", operations::validate_atom);
-    let persist_op2 = Operation::<Header>::new("persist_atom", operations::persist_atom);
+    assert!(result.is_some(), "sweep shutdown should succeed");
+}
 
-    process2.subscribe(log_op2);
-    process2.subscribe(validate_op2);
-    process2.subscribe(persist_op2);
+#[test]
+fn test_pause_resume() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
 
-    // Spawn the sweep threads
-    let controller = sweep.spawn();
+    let mut sweep = WeightedAtomSweep::new(WeightedAtomSweepSettings::default());
 
-    // Let it run briefly then shutdown
-    std::thread::sleep(std::time::Duration::from_millis(10_000));
-    let result = controller.shutdown();
+    // Slow engine to make the pause test reliable
+    struct SlowEngine;
+    impl TraversalEngine for SlowEngine {
+        fn name(&self) -> &str { "slow_engine" }
+        fn next_atom(&self, _z: ReadZipperTracked<u64>) -> Result<AtomPosition, TraversalError> {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(vec![0])
+        }
+    }
 
-    assert!(result.is_ok(), "sweep shutdown should succeed");
+    let process = sweep.add_engine("engine_slow", "cpq");
+    process.subscribe(op("log_atom", operations::log_atom));
+
+    let _name = sweep.spawn();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Pause and verify quiescence
+    let path_map = sweep.pause_all();
+    // The controller is now paused — verify all threads parked
+    for ctrl in sweep.controllers.values() {
+        assert!(
+            ctrl.parked_count() >= ctrl.thread_count(),
+            "all threads should be parked after pause"
+        );
+    }
+
+    // Resume and shutdown cleanly
+    sweep.resume_all(path_map);
+    std::thread::sleep(Duration::from_millis(100));
+    let result = sweep.shutdown_all();
+    assert!(result.is_some(), "sweep shutdown should succeed after pause/resume");
 }

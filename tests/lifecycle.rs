@@ -18,7 +18,7 @@ fn seed_map(sweep: &mut WeightedAtomSweep) {
     if let Some(ref mut m) = sweep.map {
         for &(path, val) in &[(&b"aa"[..], 10u64), (&b"ab"[..], 5), (&b"ba"[..], 20), (&b"bb"[..], 15)] {
             let mut wz = m.inner.write_zipper_at_exclusive_path(path).unwrap();
-            wz.set_val(val);
+            wz.set_val_w(val);
         }
     }
 }
@@ -82,7 +82,7 @@ fn pause_all_reclaims_correct_map() {
     if let Some(ref mut m) = sweep.map {
         for &(path, val) in &[(&b"x"[..], 42u64), (&b"yy"[..], 99), (&b"zzz"[..], 7)] {
             let mut wz = m.inner.write_zipper_at_exclusive_path(path).unwrap();
-            wz.set_val(val);
+            wz.set_val_w(val);
         }
     }
 
@@ -124,7 +124,7 @@ fn shutdown_reclaims_map() {
     sweep.add_engine("single", "cpq");
     if let Some(ref mut m) = sweep.map {
         let mut wz = m.inner.write_zipper_at_exclusive_path(b"test").unwrap();
-        wz.set_val(42u64);
+        wz.set_val_w(42u64);
     }
     let name = sweep.spawn();
 

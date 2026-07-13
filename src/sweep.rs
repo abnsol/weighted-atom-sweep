@@ -460,7 +460,7 @@ impl WeightedAtomSweep {
                                             }));
                                             wz.reset();
                                         }
-                                        map_arc.cleanup_write_zipper(wz);
+                                        map_arc.cleanup_write_zipper_w(wz);
                                         buffer.remove(i);
                                         made_progress = true;
                                     }

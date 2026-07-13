@@ -1,4 +1,4 @@
-use pathmap::zipper::WriteZipperTracked;
+use pathmap::zipper::{WriteZipperTracked, ZipperValues};
 
 /// Trait for operations that transform a submap of the PathMap trie.
 ///
@@ -54,6 +54,33 @@ impl TransformOp for Operation {
 
     fn apply(&self, wz: &mut WriteZipperTracked<u64>, atom_path: &[u8]) {
         (self.transform)(wz, atom_path);
+    }
+}
+
+/// Importance-decay transform: read the sampled atom's weight and write back a
+/// slightly smaller one. This is the canonical WAS single-atom transform and the
+/// simplest exercise of the feedback loop (visited atoms lose weight → lower future
+/// visit rate). Mirrors ECAN importance decay.
+///
+/// Input: `wz` focused at the sampled atom (its weight is the focus value); `atom_path`
+/// unused. No return — the weight change propagates via `set_val_w` (+ the sweep's
+/// `cleanup_write_zipper_w`).
+///
+/// Decay rule: subtract 10% (at least 1) so it is strictly monotonic down to 0.
+pub fn decay(wz: &mut WriteZipperTracked<u64>, _atom_path: &[u8]) {
+    if let Some(&w) = wz.val() {
+        if w > 0 {
+            let dec = (w / 10).max(1);
+            // MUST be set_val_w (not set_val) so agg_w propagates — see trait docs above.
+            wz.set_val_w(w - dec);
+        }
+    }
+}
+
+impl Operation {
+    /// The built-in importance-decay operation (see [`decay`]).
+    pub fn decay() -> Self {
+        Operation::new("decay", decay)
     }
 }
 

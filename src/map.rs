@@ -27,12 +27,12 @@ impl WeightedMap {
         }
     }
 
-    /// Set the weight at `path`. Uses `set_val` (not `set_val_w`) because
-    /// this is a direct map operation — no agg_w propagation is needed
-    /// at this level.
+    /// Set the weight at `path`. Uses `set_val_w` so that agg_w is
+    /// propagated to ancestors — required for sweeps to read accurate
+    /// aggregate weights during sampling.
     pub fn set_weighted_val(&self, path: &[u8], val: u64) -> Result<(), ()> {
         if let Ok(mut z) = self.inner.write_zipper_at_exclusive_path(path) {
-            z.set_val(val);
+            z.set_val_w(val);
             Ok(())
         } else {
             Err(())

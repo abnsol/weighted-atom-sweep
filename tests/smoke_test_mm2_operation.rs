@@ -95,7 +95,7 @@ fn test_exec_no_pattern_add() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
 
     let map = space.into_map();
@@ -133,7 +133,7 @@ fn test_exec_no_pattern_remove() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
 
     let map = space.into_map();
@@ -172,7 +172,7 @@ fn test_exec_match_only() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
 
     assert_eq!(
@@ -218,7 +218,7 @@ fn test_exec_pattern_then_add() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
 
     assert_eq!(op.match_count(), 2);
@@ -281,7 +281,7 @@ fn test_exec_pattern_then_remove() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
 
     assert_eq!(op.match_count(), 2);
@@ -343,7 +343,7 @@ fn test_exec_rewrite_rule() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
 
     let map = space.into_map();
@@ -385,7 +385,7 @@ fn test_exec_match_count_accumulates() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
     assert_eq!(op.match_count(), 2);
 
@@ -393,7 +393,7 @@ fn test_exec_match_count_accumulates() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
     assert_eq!(op.match_count(), 4);
 
@@ -403,7 +403,7 @@ fn test_exec_match_count_accumulates() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
     assert_eq!(op.match_count(), 2);
 }
@@ -522,7 +522,7 @@ fn test_exec_with_noise() {
     {
         let mut wz = space.write_zipper_at_exclusive_path(&[] as &[u8]).unwrap();
         op.apply(&mut wz, &[]);
-        space.cleanup_write_zipper(wz);
+        space.cleanup_write_zipper_w(wz);
     }
 
     assert_eq!(op.match_count(), 2, "noise should not affect match count");

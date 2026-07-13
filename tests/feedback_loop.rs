@@ -20,6 +20,7 @@ fn decay_feedback_loop_decreases_root_agg_w() {
     }
 
     // Seed with known weights via set_val_w
+    sweep.init_map();
     {
         let m = sweep.map.as_mut().expect("map must be initialized");
         for &(path, val) in &[(&b"aa"[..], 100u64), (&b"ab"[..], 200), (&b"ac"[..], 50)] {
@@ -59,6 +60,7 @@ fn decay_converges_to_zero_over_many_cycles() {
     }
 
     // Seed a single atom with weight 10
+    sweep.init_map();
     {
         let m = sweep.map.as_mut().expect("map must be initialized");
         let mut wz = m.inner.write_zipper_at_exclusive_path(b"x").unwrap();

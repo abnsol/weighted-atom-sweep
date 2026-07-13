@@ -237,21 +237,25 @@ pub struct WeightedAtomSweep {
 }
 
 impl WeightedAtomSweep {
+    /// this will automatically instantiate a weighted map if sweep is called before any foreground metta calculus task
+    pub fn init_map(&mut self) {
+        if self.map.is_none() {
+            self.map = Some(WeightedMap {
+                inner: Arc::new(PathMap::<u64>::new().into_zipper_head([])),
+            });
+        }
+    }
+
     #[instrument(skip_all, name = "sweep.new")]
     pub fn new(settings: WeightedAtomSweepSettings) -> Self {
         debug!("initializing WeightedAtomSweep");
-        trace!("creating new PathMap and initializing WeightedMap");
-
         let result = Self {
             processes: HashMap::new(),
             settings,
-            map: Some(WeightedMap {
-                inner: Arc::new(PathMap::<u64>::new().into_zipper_head([])),
-            }),
+            map: None,
             controllers: HashMap::new(),
             next_id: 0,
         };
-
         debug!("WeightedAtomSweep initialization complete");
         result
     }
@@ -301,10 +305,8 @@ impl WeightedAtomSweep {
             debug!("warning: no processes added, sweep will do nothing");
         }
 
-        let map_arc = self.map.as_ref()
-            .expect("map must be set before spawn() — call Space to enter STATE B")
-            .inner
-            .clone();
+        self.init_map();
+        let map_arc = self.map.as_ref().unwrap().inner.clone();
 
         let map_lock = Arc::new(RwLock::new(Some(map_arc)));
         let shutdown = Arc::new(AtomicBool::new(false));

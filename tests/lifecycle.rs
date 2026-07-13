@@ -3,7 +3,9 @@ use pathmap::zipper::{ZipperCreation, ZipperValues, ZipperWriting};
 use weighted_atom_sweep::{WeightedAtomSweep, WeightedAtomSweepSettings};
 
 fn make_sweep() -> WeightedAtomSweep {
-    WeightedAtomSweep::new(WeightedAtomSweepSettings::default())
+    let mut s = WeightedAtomSweep::new(WeightedAtomSweepSettings::default());
+    s.init_map();
+    s
 }
 
 fn add_three_processes(sweep: &mut WeightedAtomSweep) {
@@ -212,4 +214,11 @@ fn pause_all_then_shutdown() {
     drop(map);
     let result = sweep.shutdown_all();
     assert!(result.is_none(), "shutdown should return None when map was already reclaimed by pause");
+}
+
+#[test]
+fn state_a_at_birth() {
+    let s = WeightedAtomSweep::new(WeightedAtomSweepSettings::default());
+    assert!(s.map.is_none(), "STATE A at birth: map should be None");
+    assert!(s.controllers.is_empty(), "no controllers at birth");
 }

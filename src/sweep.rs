@@ -216,10 +216,10 @@ impl Drop for SweepController {
             let _ = handle.join();
         }
 
-        if let Ok(mut guard) = self.map.write() {
-            *guard = None;
-        }
-
+        // Do NOT null `self.map` here: it is the shared lease slot cloned across every
+        // controller of this WAS. Nulling it on a non-last drop would pull the trie out
+        // from under the still-running sweeps. The WAS-level pause_all/shutdown own the
+        // slot's lifecycle and reclaim the trie explicitly.
         debug!("SweepController dropped cleanly");
     }
 }
@@ -314,9 +314,16 @@ impl WeightedAtomSweep {
         }
 
         self.init_map();
-        let map_arc = self.map.as_ref().unwrap().inner.clone();
-
-        let map_lock = Arc::new(RwLock::new(Some(map_arc)));
+        // Every controller spawned by this WAS shares ONE lease slot. Reuse the slot
+        // an existing controller already holds; only the first spawn mints it. This is
+        // what lets pause_all/shutdown drop the leased head to strong_count 1 and
+        // reclaim the trie no matter how many sweeps are running — the previous code
+        // minted a fresh slot per spawn, so N sweeps left N live clones and reclaim
+        // panicked in the multi-sweep case.
+        let map_lock = match self.controllers.values().next() {
+            Some(ctrl) => ctrl.map.clone(),
+            None => Arc::new(RwLock::new(Some(self.map.as_ref().unwrap().inner.clone()))),
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let parked_count = Arc::new(AtomicUsize::new(0));

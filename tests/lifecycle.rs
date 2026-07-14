@@ -222,3 +222,60 @@ fn state_a_at_birth() {
     assert!(s.map.is_none(), "STATE A at birth: map should be None");
     assert!(s.controllers.is_empty(), "no controllers at birth");
 }
+
+/// B3 load-bearing invariant: with MULTIPLE controllers, `pause_all` must reclaim the
+/// trie. All controllers spawned by one WAS share ONE lease slot, so when they park the
+/// leased head's strong count drops to 1 and `try_unwrap` succeeds. Before the
+/// shared-slot fix each spawn minted its own slot, leaving a live clone per extra sweep,
+/// and `pause_all` panicked (`strong_count != 1`). Run repeatedly (`cargo test` 5×+) —
+/// a refcount race can pass 1-in-3.
+#[test]
+fn pause_all_reclaims_with_multiple_controllers() {
+    let mut sweep = make_sweep();
+    sweep.add_engine("first", "random_walk");
+    seed_map(&mut sweep);
+    let n1 = sweep.spawn();
+
+    // Register a SECOND independent sweep — a new spawn = a new controller sharing the
+    // same trie. (Can't seed while threads run.)
+    sweep.add_engine("second", "cpq");
+    let n2 = sweep.spawn();
+    assert_eq!(sweep.controllers.len(), 2, "two spawns = two controllers");
+    assert_ne!(n1, n2, "spawn handles must be unique");
+
+    // THE fix under test: pause_all with two controllers must not panic and must reclaim.
+    let map = sweep.pause_all();
+    assert!(sweep.map.is_none(), "STATE A after pause_all");
+    let z = map.read_zipper_at_path(b"aa");
+    assert_eq!(z.val(), Some(&10u64), "seeded value survives multi-sweep reclaim");
+
+    // Resume both; both controllers stay registered and active.
+    sweep.resume_all(map);
+    assert_eq!(sweep.controllers.len(), 2, "both controllers survive resume");
+    for ctrl in sweep.controllers.values() {
+        assert!(!ctrl.is_paused(), "controller active after resume");
+    }
+
+    sweep.shutdown_all();
+    assert!(sweep.controllers.is_empty());
+}
+
+/// Multi-controller `shutdown_all` must fold B→A and hand back the trie (last controller
+/// reclaims). Before the fix, a non-last controller's Drop nulled the shared slot, so the
+/// last shutdown found nothing to reclaim and the trie was lost.
+#[test]
+fn shutdown_all_reclaims_with_multiple_controllers() {
+    let mut sweep = make_sweep();
+    sweep.add_engine("first", "random_walk");
+    seed_map(&mut sweep);
+    sweep.spawn();
+    sweep.add_engine("second", "cpq");
+    sweep.spawn();
+    assert_eq!(sweep.controllers.len(), 2);
+
+    let reclaimed = sweep.shutdown_all();
+    assert!(sweep.controllers.is_empty(), "all controllers gone");
+    let map = reclaimed.expect("last controller must reclaim the trie");
+    let z = map.read_zipper_at_path(b"aa");
+    assert_eq!(z.val(), Some(&10u64), "seeded value survives multi-sweep shutdown");
+}

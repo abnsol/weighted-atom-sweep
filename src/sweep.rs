@@ -246,6 +246,14 @@ impl WeightedAtomSweep {
         }
     }
 
+    /// Transfer a PathMap into the sweep as its weighted map (STATE B).
+    /// Used by Space::sweep() to give its btm to the sweep threads.
+    pub fn take_trie(&mut self, btm: PathMap<u64>) {
+        self.map = Some(WeightedMap {
+            inner: Arc::new(btm.into_zipper_head([])),
+        });
+    }
+
     #[instrument(skip_all, name = "sweep.new")]
     pub fn new(settings: WeightedAtomSweepSettings) -> Self {
         debug!("initializing WeightedAtomSweep");
